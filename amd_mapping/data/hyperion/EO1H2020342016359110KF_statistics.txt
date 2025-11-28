@@ -1,0 +1,15 @@
+Hyperion Image Processing Statistics
+=====================================
+
+Image ID: EO1H2020342016359110KF
+Image dimensions: 3311 x 891 pixels
+Number of bands: 195
+Wavelength range: 426.8 - 2385.4 nm
+
+Valid pixels: 843548 / 2950101 (28.6%)
+
+NDVI Statistics:
+  Min: -0.835
+  Max: 0.844
+  Mean: 0.387
+  Std: 0.220
