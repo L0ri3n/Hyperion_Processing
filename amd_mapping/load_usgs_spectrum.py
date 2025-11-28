@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # CONFIGURATION: Path to minerals folder
-MINERALS_DIR = r"C:/Lorien/Archivos/TUBAF/1st_Semester/Remote_Sensing/PROCESSING_AND_POST/amd_mapping/data/spectral_library/usgs/ASCIIdata/ASCIIdata_splib07b_cvHYPERION/ChapterM_Minerals"
+MINERALS_DIR = r"C:\Lorien\Archivos\TUBAF\1st_Semester\Remote_Sensing\PROCESSING_AND_POST\amd_mapping\data\spectral_library\usgs\ASCIIdata\ASCIIdata_splib07b_cvHYPERION\ChapterM_Minerals"
 
 # CONFIGURATION: List of minerals to load
 # Add or remove mineral names as needed
@@ -83,11 +83,11 @@ def load_minerals_spectra(mineral_list=None, minerals_dir=MINERALS_DIR):
             try:
                 wvl, ref = load_usgs_spectrum(filepath)
                 spectra[mineral] = (wvl, ref)
-                print("[OK] Loaded: {} ({} points)".format(mineral, len(wvl)))
+                print(f"[OK] Loaded: {mineral} ({len(wvl)} points)")
             except Exception as e:
-                print("[ERROR] Error loading {}: {}".format(mineral, e))
+                print(f"[ERROR] Error loading {mineral}: {e}")
         else:
-            print("[NOT FOUND] File not found for: {}".format(mineral))
+            print(f"[NOT FOUND] File not found for: {mineral}")
 
     return spectra
 
@@ -96,7 +96,7 @@ if __name__ == "__main__":
     # Load minerals specified in MINERALS_TO_LOAD
     spectra = load_minerals_spectra()
 
-    print("\nTotal spectra loaded: {}".format(len(spectra)))
+    print(f"\nTotal spectra loaded: {len(spectra)}")
 
     # Plot all loaded spectra
     if spectra:
