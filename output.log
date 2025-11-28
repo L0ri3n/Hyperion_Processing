@@ -1,0 +1,684 @@
+======================================================================
+AMD MINERAL MAPPING WORKFLOW
+======================================================================
+
+Configuration:
+  - Build Library: False
+  - Enhancement: False
+  - SAM Classification: True
+  - MTMF: False
+  - Postprocessing: False
+  - Validation: False
+  - Export: True
+======================================================================
+
+=== Loading Data ===
+Loading Hyperion cube: ./amd_mapping/data/hyperion/EO1H2020342016359110KF_reflectance.hdr
+  Processing full image: 3311 x 891 x 195 bands
+  Data already preprocessed with 195 bands
+  Converting spectral image to numpy array...
+  Cube shape: (3311, 891, 195)
+  Cube type: <class 'numpy.ndarray'>
+Loading endmember library: ./amd_mapping/data/outputs/endmember_library_matched.csv
+  Loaded 8 minerals: ['Jarosite', 'Goethite', 'Hematite', 'Kaolinite', 'Alunite', 'Illite', 'Smectite', 'Gypsum']
+
+======================================================================
+CRITICAL DIAGNOSTIC CHECKS
+======================================================================
+
+1. BAND COUNT CHECK:
+  Cube bands: 195
+  Endmember bands: 195
+  [OK] Band counts match!
+
+2. SCALE CHECK:
+  Cube range: 1.000000 to 65535.000000
+  Endmember range: 0.019004 to 0.914763
+  [WARNING] Values > 2.0 detected (should be 0-1 reflectance)
+  Applying scale correction to cube...
+  Detected 16-bit scale (0-65535), dividing by 65535...
+  Cube range after scaling: 0.000000 to 1.000000
+
+3. DATA VALIDITY CHECK:
+  Valid pixels: 843,548 / 2,950,101 (28.6%)
+  [OK] Data contains valid pixels
+
+4. MANUAL SPECTRAL ANGLE TEST:
+  Testing pixel at (1655, 445)
+  Pixel range: 0.000000 to 1.000000
+
+  Test pixel vs Jarosite:
+    cos(angle) = 0.194721
+    angle = 1.3748 rad (78.8 deg)
+    [NO] Would not classify (threshold 0.40)
+
+  Test pixel vs Goethite:
+    cos(angle) = 0.160317
+    angle = 1.4098 rad (80.8 deg)
+    [NO] Would not classify (threshold 0.40)
+
+  Test pixel vs Hematite:
+    cos(angle) = 0.147483
+    angle = 1.4228 rad (81.5 deg)
+    [NO] Would not classify (threshold 0.40)
+======================================================================
+
+
+=== GENERATING DIAGNOSTIC PLOTS ===
+Creating mineral spectra plot...
+  Saved: ./amd_mapping/outputs/classifications\diagnostic_plots\mineral_spectra.png
+Creating individual mineral spectra plots...
+  Saved: ./amd_mapping/outputs/classifications\diagnostic_plots\mineral_spectra_individual.png
+Creating Hyperion RGB composite...
+  Saved: ./amd_mapping/outputs/classifications\diagnostic_plots\hyperion_rgb.png
+Creating sample pixel spectra plot...
+  Saved: ./amd_mapping/outputs/classifications\diagnostic_plots\sample_pixel_spectra.png
+Creating mean image spectrum comparison...
+  Saved: ./amd_mapping/outputs/classifications\diagnostic_plots\mean_spectrum_comparison.png
+
+All diagnostic plots saved to: ./amd_mapping/outputs/classifications\diagnostic_plots
+======================================================================
+
+
+=== STEP 3: Spectral Enhancement SKIPPED ===
+
+=== STEP 4: Running SAM Classification ===
+Threshold: 0.4 radians
+Computing spectral angles...
+  Processing Jarosite...
+    Row 0/3311
+    Row 50/3311
+    Row 100/3311
+    Row 150/3311
+    Row 200/3311
+    Row 250/3311
+    Row 300/3311
+    Row 350/3311
+    Row 400/3311
+    Row 450/3311
+    Row 500/3311
+    Row 550/3311
+    Row 600/3311
+    Row 650/3311
+    Row 700/3311
+    Row 750/3311
+    Row 800/3311
+    Row 850/3311
+    Row 900/3311
+    Row 950/3311
+    Row 1000/3311
+    Row 1050/3311
+    Row 1100/3311
+    Row 1150/3311
+    Row 1200/3311
+    Row 1250/3311
+    Row 1300/3311
+    Row 1350/3311
+    Row 1400/3311
+    Row 1450/3311
+    Row 1500/3311
+    Row 1550/3311
+    Row 1600/3311
+    Row 1650/3311
+    Row 1700/3311
+    Row 1750/3311
+    Row 1800/3311
+    Row 1850/3311
+    Row 1900/3311
+    Row 1950/3311
+    Row 2000/3311
+    Row 2050/3311
+    Row 2100/3311
+    Row 2150/3311
+    Row 2200/3311
+    Row 2250/3311
+    Row 2300/3311
+    Row 2350/3311
+    Row 2400/3311
+    Row 2450/3311
+    Row 2500/3311
+    Row 2550/3311
+    Row 2600/3311
+    Row 2650/3311
+    Row 2700/3311
+    Row 2750/3311
+    Row 2800/3311
+    Row 2850/3311
+    Row 2900/3311
+    Row 2950/3311
+    Row 3000/3311
+    Row 3050/3311
+    Row 3100/3311
+    Row 3150/3311
+    Row 3200/3311
+    Row 3250/3311
+    Row 3300/3311
+  Processing Goethite...
+    Row 0/3311
+    Row 50/3311
+    Row 100/3311
+    Row 150/3311
+    Row 200/3311
+    Row 250/3311
+    Row 300/3311
+    Row 350/3311
+    Row 400/3311
+    Row 450/3311
+    Row 500/3311
+    Row 550/3311
+    Row 600/3311
+    Row 650/3311
+    Row 700/3311
+    Row 750/3311
+    Row 800/3311
+    Row 850/3311
+    Row 900/3311
+    Row 950/3311
+    Row 1000/3311
+    Row 1050/3311
+    Row 1100/3311
+    Row 1150/3311
+    Row 1200/3311
+    Row 1250/3311
+    Row 1300/3311
+    Row 1350/3311
+    Row 1400/3311
+    Row 1450/3311
+    Row 1500/3311
+    Row 1550/3311
+    Row 1600/3311
+    Row 1650/3311
+    Row 1700/3311
+    Row 1750/3311
+    Row 1800/3311
+    Row 1850/3311
+    Row 1900/3311
+    Row 1950/3311
+    Row 2000/3311
+    Row 2050/3311
+    Row 2100/3311
+    Row 2150/3311
+    Row 2200/3311
+    Row 2250/3311
+    Row 2300/3311
+    Row 2350/3311
+    Row 2400/3311
+    Row 2450/3311
+    Row 2500/3311
+    Row 2550/3311
+    Row 2600/3311
+    Row 2650/3311
+    Row 2700/3311
+    Row 2750/3311
+    Row 2800/3311
+    Row 2850/3311
+    Row 2900/3311
+    Row 2950/3311
+    Row 3000/3311
+    Row 3050/3311
+    Row 3100/3311
+    Row 3150/3311
+    Row 3200/3311
+    Row 3250/3311
+    Row 3300/3311
+  Processing Hematite...
+    Row 0/3311
+    Row 50/3311
+    Row 100/3311
+    Row 150/3311
+    Row 200/3311
+    Row 250/3311
+    Row 300/3311
+    Row 350/3311
+    Row 400/3311
+    Row 450/3311
+    Row 500/3311
+    Row 550/3311
+    Row 600/3311
+    Row 650/3311
+    Row 700/3311
+    Row 750/3311
+    Row 800/3311
+    Row 850/3311
+    Row 900/3311
+    Row 950/3311
+    Row 1000/3311
+    Row 1050/3311
+    Row 1100/3311
+    Row 1150/3311
+    Row 1200/3311
+    Row 1250/3311
+    Row 1300/3311
+    Row 1350/3311
+    Row 1400/3311
+    Row 1450/3311
+    Row 1500/3311
+    Row 1550/3311
+    Row 1600/3311
+    Row 1650/3311
+    Row 1700/3311
+    Row 1750/3311
+    Row 1800/3311
+    Row 1850/3311
+    Row 1900/3311
+    Row 1950/3311
+    Row 2000/3311
+    Row 2050/3311
+    Row 2100/3311
+    Row 2150/3311
+    Row 2200/3311
+    Row 2250/3311
+    Row 2300/3311
+    Row 2350/3311
+    Row 2400/3311
+    Row 2450/3311
+    Row 2500/3311
+    Row 2550/3311
+    Row 2600/3311
+    Row 2650/3311
+    Row 2700/3311
+    Row 2750/3311
+    Row 2800/3311
+    Row 2850/3311
+    Row 2900/3311
+    Row 2950/3311
+    Row 3000/3311
+    Row 3050/3311
+    Row 3100/3311
+    Row 3150/3311
+    Row 3200/3311
+    Row 3250/3311
+    Row 3300/3311
+  Processing Kaolinite...
+    Row 0/3311
+    Row 50/3311
+    Row 100/3311
+    Row 150/3311
+    Row 200/3311
+    Row 250/3311
+    Row 300/3311
+    Row 350/3311
+    Row 400/3311
+    Row 450/3311
+    Row 500/3311
+    Row 550/3311
+    Row 600/3311
+    Row 650/3311
+    Row 700/3311
+    Row 750/3311
+    Row 800/3311
+    Row 850/3311
+    Row 900/3311
+    Row 950/3311
+    Row 1000/3311
+    Row 1050/3311
+    Row 1100/3311
+    Row 1150/3311
+    Row 1200/3311
+    Row 1250/3311
+    Row 1300/3311
+    Row 1350/3311
+    Row 1400/3311
+    Row 1450/3311
+    Row 1500/3311
+    Row 1550/3311
+    Row 1600/3311
+    Row 1650/3311
+    Row 1700/3311
+    Row 1750/3311
+    Row 1800/3311
+    Row 1850/3311
+    Row 1900/3311
+    Row 1950/3311
+    Row 2000/3311
+    Row 2050/3311
+    Row 2100/3311
+    Row 2150/3311
+    Row 2200/3311
+    Row 2250/3311
+    Row 2300/3311
+    Row 2350/3311
+    Row 2400/3311
+    Row 2450/3311
+    Row 2500/3311
+    Row 2550/3311
+    Row 2600/3311
+    Row 2650/3311
+    Row 2700/3311
+    Row 2750/3311
+    Row 2800/3311
+    Row 2850/3311
+    Row 2900/3311
+    Row 2950/3311
+    Row 3000/3311
+    Row 3050/3311
+    Row 3100/3311
+    Row 3150/3311
+    Row 3200/3311
+    Row 3250/3311
+    Row 3300/3311
+  Processing Alunite...
+    Row 0/3311
+    Row 50/3311
+    Row 100/3311
+    Row 150/3311
+    Row 200/3311
+    Row 250/3311
+    Row 300/3311
+    Row 350/3311
+    Row 400/3311
+    Row 450/3311
+    Row 500/3311
+    Row 550/3311
+    Row 600/3311
+    Row 650/3311
+    Row 700/3311
+    Row 750/3311
+    Row 800/3311
+    Row 850/3311
+    Row 900/3311
+    Row 950/3311
+    Row 1000/3311
+    Row 1050/3311
+    Row 1100/3311
+    Row 1150/3311
+    Row 1200/3311
+    Row 1250/3311
+    Row 1300/3311
+    Row 1350/3311
+    Row 1400/3311
+    Row 1450/3311
+    Row 1500/3311
+    Row 1550/3311
+    Row 1600/3311
+    Row 1650/3311
+    Row 1700/3311
+    Row 1750/3311
+    Row 1800/3311
+    Row 1850/3311
+    Row 1900/3311
+    Row 1950/3311
+    Row 2000/3311
+    Row 2050/3311
+    Row 2100/3311
+    Row 2150/3311
+    Row 2200/3311
+    Row 2250/3311
+    Row 2300/3311
+    Row 2350/3311
+    Row 2400/3311
+    Row 2450/3311
+    Row 2500/3311
+    Row 2550/3311
+    Row 2600/3311
+    Row 2650/3311
+    Row 2700/3311
+    Row 2750/3311
+    Row 2800/3311
+    Row 2850/3311
+    Row 2900/3311
+    Row 2950/3311
+    Row 3000/3311
+    Row 3050/3311
+    Row 3100/3311
+    Row 3150/3311
+    Row 3200/3311
+    Row 3250/3311
+    Row 3300/3311
+  Processing Illite...
+    Row 0/3311
+    Row 50/3311
+    Row 100/3311
+    Row 150/3311
+    Row 200/3311
+    Row 250/3311
+    Row 300/3311
+    Row 350/3311
+    Row 400/3311
+    Row 450/3311
+    Row 500/3311
+    Row 550/3311
+    Row 600/3311
+    Row 650/3311
+    Row 700/3311
+    Row 750/3311
+    Row 800/3311
+    Row 850/3311
+    Row 900/3311
+    Row 950/3311
+    Row 1000/3311
+    Row 1050/3311
+    Row 1100/3311
+    Row 1150/3311
+    Row 1200/3311
+    Row 1250/3311
+    Row 1300/3311
+    Row 1350/3311
+    Row 1400/3311
+    Row 1450/3311
+    Row 1500/3311
+    Row 1550/3311
+    Row 1600/3311
+    Row 1650/3311
+    Row 1700/3311
+    Row 1750/3311
+    Row 1800/3311
+    Row 1850/3311
+    Row 1900/3311
+    Row 1950/3311
+    Row 2000/3311
+    Row 2050/3311
+    Row 2100/3311
+    Row 2150/3311
+    Row 2200/3311
+    Row 2250/3311
+    Row 2300/3311
+    Row 2350/3311
+    Row 2400/3311
+    Row 2450/3311
+    Row 2500/3311
+    Row 2550/3311
+    Row 2600/3311
+    Row 2650/3311
+    Row 2700/3311
+    Row 2750/3311
+    Row 2800/3311
+    Row 2850/3311
+    Row 2900/3311
+    Row 2950/3311
+    Row 3000/3311
+    Row 3050/3311
+    Row 3100/3311
+    Row 3150/3311
+    Row 3200/3311
+    Row 3250/3311
+    Row 3300/3311
+  Processing Smectite...
+    Row 0/3311
+    Row 50/3311
+    Row 100/3311
+    Row 150/3311
+    Row 200/3311
+    Row 250/3311
+    Row 300/3311
+    Row 350/3311
+    Row 400/3311
+    Row 450/3311
+    Row 500/3311
+    Row 550/3311
+    Row 600/3311
+    Row 650/3311
+    Row 700/3311
+    Row 750/3311
+    Row 800/3311
+    Row 850/3311
+    Row 900/3311
+    Row 950/3311
+    Row 1000/3311
+    Row 1050/3311
+    Row 1100/3311
+    Row 1150/3311
+    Row 1200/3311
+    Row 1250/3311
+    Row 1300/3311
+    Row 1350/3311
+    Row 1400/3311
+    Row 1450/3311
+    Row 1500/3311
+    Row 1550/3311
+    Row 1600/3311
+    Row 1650/3311
+    Row 1700/3311
+    Row 1750/3311
+    Row 1800/3311
+    Row 1850/3311
+    Row 1900/3311
+    Row 1950/3311
+    Row 2000/3311
+    Row 2050/3311
+    Row 2100/3311
+    Row 2150/3311
+    Row 2200/3311
+    Row 2250/3311
+    Row 2300/3311
+    Row 2350/3311
+    Row 2400/3311
+    Row 2450/3311
+    Row 2500/3311
+    Row 2550/3311
+    Row 2600/3311
+    Row 2650/3311
+    Row 2700/3311
+    Row 2750/3311
+    Row 2800/3311
+    Row 2850/3311
+    Row 2900/3311
+    Row 2950/3311
+    Row 3000/3311
+    Row 3050/3311
+    Row 3100/3311
+    Row 3150/3311
+    Row 3200/3311
+    Row 3250/3311
+    Row 3300/3311
+  Processing Gypsum...
+    Row 0/3311
+    Row 50/3311
+    Row 100/3311
+    Row 150/3311
+    Row 200/3311
+    Row 250/3311
+    Row 300/3311
+    Row 350/3311
+    Row 400/3311
+    Row 450/3311
+    Row 500/3311
+    Row 550/3311
+    Row 600/3311
+    Row 650/3311
+    Row 700/3311
+    Row 750/3311
+    Row 800/3311
+    Row 850/3311
+    Row 900/3311
+    Row 950/3311
+    Row 1000/3311
+    Row 1050/3311
+    Row 1100/3311
+    Row 1150/3311
+    Row 1200/3311
+    Row 1250/3311
+    Row 1300/3311
+    Row 1350/3311
+    Row 1400/3311
+    Row 1450/3311
+    Row 1500/3311
+    Row 1550/3311
+    Row 1600/3311
+    Row 1650/3311
+    Row 1700/3311
+    Row 1750/3311
+    Row 1800/3311
+    Row 1850/3311
+    Row 1900/3311
+    Row 1950/3311
+    Row 2000/3311
+    Row 2050/3311
+    Row 2100/3311
+    Row 2150/3311
+    Row 2200/3311
+    Row 2250/3311
+    Row 2300/3311
+    Row 2350/3311
+    Row 2400/3311
+    Row 2450/3311
+    Row 2500/3311
+    Row 2550/3311
+    Row 2600/3311
+    Row 2650/3311
+    Row 2700/3311
+    Row 2750/3311
+    Row 2800/3311
+    Row 2850/3311
+    Row 2900/3311
+    Row 2950/3311
+    Row 3000/3311
+    Row 3050/3311
+    Row 3100/3311
+    Row 3150/3311
+    Row 3200/3311
+    Row 3250/3311
+    Row 3300/3311
+Creating classification map...
+
+Classification results:
+Unclassified: 2950101 pixels
+Jarosite: 0 pixels (0.00%)
+Goethite: 0 pixels (0.00%)
+Hematite: 0 pixels (0.00%)
+Kaolinite: 0 pixels (0.00%)
+Alunite: 0 pixels (0.00%)
+Illite: 0 pixels (0.00%)
+Smectite: 0 pixels (0.00%)
+Gypsum: 0 pixels (0.00%)
+
+SAM Classification completed!
+
+=== STEP 5: MTMF SKIPPED ===
+
+=== STEP 6: Postprocessing SKIPPED ===
+
+=== STEP 7: Validation SKIPPED ===
+
+=== STEP 8: Exporting Results ===
+Exporting SAM classification map...
+  Saved: ./amd_mapping/outputs/classifications\sam_multiclass.hdr
+Exporting individual angle maps...
+  Saved: ./amd_mapping/outputs/classifications\sam_angle_Jarosite.hdr
+  Saved: ./amd_mapping/outputs/classifications\sam_angle_Goethite.hdr
+  Saved: ./amd_mapping/outputs/classifications\sam_angle_Hematite.hdr
+  Saved: ./amd_mapping/outputs/classifications\sam_angle_Kaolinite.hdr
+  Saved: ./amd_mapping/outputs/classifications\sam_angle_Alunite.hdr
+  Saved: ./amd_mapping/outputs/classifications\sam_angle_Illite.hdr
+  Saved: ./amd_mapping/outputs/classifications\sam_angle_Smectite.hdr
+  Saved: ./amd_mapping/outputs/classifications\sam_angle_Gypsum.hdr
+
+Generating classification statistics...
+  Saved statistics: ./amd_mapping/outputs/classifications\classification_statistics.csv
+
+       Class  Code  Pixels  Percent
+Unclassified     0 2950101    100.0
+    Jarosite     1       0      0.0
+    Goethite     2       0      0.0
+    Hematite     3       0      0.0
+   Kaolinite     4       0      0.0
+     Alunite     5       0      0.0
+      Illite     6       0      0.0
+    Smectite     7       0      0.0
+      Gypsum     8       0      0.0
+
+All results exported to: ./amd_mapping/outputs/classifications
+
+======================================================================
+WORKFLOW COMPLETE!
+======================================================================

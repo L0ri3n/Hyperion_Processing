@@ -396,7 +396,7 @@ def run_sam_single_mineral(cube, endmember_spectrum, threshold=0.10):
     rows, cols, bands = cube.shape
     angle_map = np.zeros((rows, cols), dtype=np.float32)
 
-    print(f"Processing {rows} × {cols} pixels...")
+    print(f"Processing {rows} x {cols} pixels...")
     for i in range(rows):
         if i % 50 == 0:
             print(f"  Row {i}/{rows}")
@@ -1037,7 +1037,7 @@ def main_workflow():
     OUTPUT_DIR = './amd_mapping/outputs/classifications'
 
     # SAM parameters
-    SAM_THRESHOLD = 0.40  # radians (smaller = more strict)
+    SAM_THRESHOLD = 1.40  # radians (smaller = more strict)
 
     # Subset for testing (set to None to process full image)
     # Format: ((row_start, row_end), (col_start, col_end))
@@ -1099,14 +1099,304 @@ def main_workflow():
         print("  Processing full image: {} x {} x {} bands".format(
             img.nrows, img.ncols, img.nbands))
         cube = img.load()
+        # Only filter bands if we have the full 242-band dataset
+        if img.nbands == 242:
+            usable_bands = get_usable_bands()
+            cube = cube[:, :, usable_bands]
+            print("  Filtered to {} usable bands".format(len(usable_bands)))
+        else:
+            print("  Data already preprocessed with {} bands".format(img.nbands))
+
+    # Convert to numpy array - img.load() returns a memmap-like object
+    print("  Converting spectral image to numpy array...")
+    cube = np.asarray(cube, dtype=np.float32)
 
     print("  Cube shape: {}".format(cube.shape))
+    print("  Cube type: {}".format(type(cube)))
 
     # Load endmember library
     print("Loading endmember library: {}".format(ENDMEMBER_LIBRARY_PATH))
     library_df = pd.read_csv(ENDMEMBER_LIBRARY_PATH, index_col=0)
     endmembers = {name: library_df[name].values for name in library_df.columns}
     print("  Loaded {} minerals: {}".format(len(endmembers), list(endmembers.keys())))
+
+    # ========================================================================
+    # CRITICAL DIAGNOSTIC: Check band counts and scales
+    # ========================================================================
+    print("\n" + "=" * 70)
+    print("CRITICAL DIAGNOSTIC CHECKS")
+    print("=" * 70)
+
+    # Check 1: Band counts
+    cube_bands = cube.shape[2]
+    endmember_bands = len(list(endmembers.values())[0])
+    print("\n1. BAND COUNT CHECK:")
+    print("  Cube bands: {}".format(cube_bands))
+    print("  Endmember bands: {}".format(endmember_bands))
+
+    if cube_bands != endmember_bands:
+        print("  *** CRITICAL ERROR: Band mismatch!")
+        print("  SAM CANNOT WORK with different band counts!")
+        print("\n  Need to match the bands...")
+
+        # Try to match by trimming cube to endmember length
+        if cube_bands > endmember_bands:
+            print("  Trimming cube from {} to {} bands".format(cube_bands, endmember_bands))
+            cube = cube[:, :, :endmember_bands]
+            print("  New cube shape: {}".format(cube.shape))
+        else:
+            print("  ERROR: Cube has fewer bands than endmembers!")
+            print("  Cannot proceed - check your endmember library file")
+    else:
+        print("  [OK] Band counts match!")
+
+    # Check 2: Scale validation
+    cube_max = np.max(cube[cube > 0]) if np.any(cube > 0) else 0
+    cube_min = np.min(cube[cube > 0]) if np.any(cube > 0) else 0
+    endmember_max = max(np.max(spec) for spec in endmembers.values())
+    endmember_min = min(np.min(spec) for spec in endmembers.values())
+
+    print("\n2. SCALE CHECK:")
+    print("  Cube range: {:.6f} to {:.6f}".format(cube_min, cube_max))
+    print("  Endmember range: {:.6f} to {:.6f}".format(endmember_min, endmember_max))
+
+    if cube_max > 2.0 or endmember_max > 2.0:
+        print("  [WARNING] Values > 2.0 detected (should be 0-1 reflectance)")
+        if cube_max > 2.0:
+            print("  Applying scale correction to cube...")
+            # Check if values are in 0-65535 range (16-bit) or 0-10000 range
+            if cube_max > 10000:
+                print("  Detected 16-bit scale (0-65535), dividing by 65535...")
+                cube = cube / 65535.0
+            else:
+                print("  Detected 10000 scale, dividing by 10000...")
+                cube = cube / 10000.0
+            print("  Cube range after scaling: {:.6f} to {:.6f}".format(np.min(cube), np.max(cube)))
+        if endmember_max > 2.0:
+            print("  Applying scale correction to endmembers...")
+            endmembers = {name: spec / 10000.0 for name, spec in endmembers.items()}
+            endmember_max = max(np.max(spec) for spec in endmembers.values())
+            print("  Endmember range after scaling: {:.6f} to {:.6f}".format(endmember_min, endmember_max))
+    else:
+        print("  [OK] Scales look correct (0-1 range)")
+
+    # Check 3: Valid pixels
+    valid_pixels = np.sum(np.any(cube > 0, axis=2))
+    total_pixels = cube.shape[0] * cube.shape[1]
+    print("\n3. DATA VALIDITY CHECK:")
+    print("  Valid pixels: {:,} / {:,} ({:.1f}%)".format(
+        valid_pixels, total_pixels, valid_pixels/total_pixels*100))
+
+    if valid_pixels == 0:
+        print("  *** CRITICAL ERROR: No valid pixels!")
+        print("  Cannot proceed - check your Hyperion data file")
+    else:
+        print("  [OK] Data contains valid pixels")
+
+    # Check 4: Manual spectral angle test
+    print("\n4. MANUAL SPECTRAL ANGLE TEST:")
+    test_row, test_col = cube.shape[0]//2, cube.shape[1]//2
+    test_pixel = cube[test_row, test_col, :]
+
+    if np.any(test_pixel > 0):
+        print("  Testing pixel at ({}, {})".format(test_row, test_col))
+        print("  Pixel range: {:.6f} to {:.6f}".format(np.min(test_pixel), np.max(test_pixel)))
+
+        for mineral_name in list(endmembers.keys())[:3]:  # Test first 3 minerals
+            test_endmember = endmembers[mineral_name]
+            dot = np.dot(test_pixel, test_endmember)
+            norm_p = np.linalg.norm(test_pixel)
+            norm_e = np.linalg.norm(test_endmember)
+
+            if norm_p > 0 and norm_e > 0:
+                cos_angle = dot / (norm_p * norm_e)
+                print("\n  {} vs {}:".format("Test pixel", mineral_name))
+                print("    cos(angle) = {:.6f}".format(cos_angle))
+
+                if cos_angle > 1.0 or cos_angle < -1.0:
+                    print("    *** INVALID! Scale mismatch detected!")
+                else:
+                    angle = np.arccos(cos_angle)
+                    print("    angle = {:.4f} rad ({:.1f} deg)".format(angle, np.degrees(angle)))
+                    if angle < SAM_THRESHOLD:
+                        print("    [OK] Would classify at threshold {:.2f}".format(SAM_THRESHOLD))
+                    else:
+                        print("    [NO] Would not classify (threshold {:.2f})".format(SAM_THRESHOLD))
+    else:
+        print("  Test pixel is invalid (all zeros)")
+
+    print("=" * 70 + "\n")
+
+    # ========================================================================
+    # VISUALIZATION: Plot mineral spectra and Hyperion data
+    # ========================================================================
+    print("\n=== GENERATING DIAGNOSTIC PLOTS ===")
+
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend for saving files
+    import matplotlib.pyplot as plt
+    import os
+
+    # Create output directory for plots
+    plot_dir = os.path.join(OUTPUT_DIR, 'diagnostic_plots')
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # Plot 1: All mineral spectra
+    print("Creating mineral spectra plot...")
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    # Get wavelengths from the library index
+    wavelengths = library_df.index.values.astype(float)
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(endmembers)))
+    for idx, (mineral_name, spectrum) in enumerate(endmembers.items()):
+        ax.plot(wavelengths[:len(spectrum)], spectrum, label=mineral_name,
+                linewidth=2, color=colors[idx])
+
+    ax.set_xlabel('Wavelength (nm)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Reflectance', fontsize=12, fontweight='bold')
+    ax.set_title('AMD Mineral Endmember Spectra (Hyperion Wavelengths)',
+                 fontsize=14, fontweight='bold')
+    ax.legend(fontsize=10, loc='best')
+    ax.grid(True, alpha=0.3)
+
+    # Highlight diagnostic regions
+    ax.axvspan(2200, 2260, alpha=0.15, color='yellow', label='Jarosite (2200-2260nm)')
+    ax.axvspan(850, 950, alpha=0.15, color='red', label='Fe oxides (850-950nm)')
+
+    plt.tight_layout()
+    plot_path = os.path.join(plot_dir, 'mineral_spectra.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  Saved: {}".format(plot_path))
+
+    # Plot 2: Individual mineral spectra (separate subplots)
+    print("Creating individual mineral spectra plots...")
+    n_minerals = len(endmembers)
+    n_cols = 3
+    n_rows = int(np.ceil(n_minerals / n_cols))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, n_rows*3))
+    axes = axes.flatten() if n_minerals > 1 else [axes]
+
+    for idx, (mineral_name, spectrum) in enumerate(endmembers.items()):
+        ax = axes[idx]
+        ax.plot(wavelengths[:len(spectrum)], spectrum, linewidth=2, color=colors[idx])
+        ax.set_title(mineral_name, fontsize=11, fontweight='bold')
+        ax.set_xlabel('Wavelength (nm)', fontsize=9)
+        ax.set_ylabel('Reflectance', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, max(1.0, np.max(spectrum) * 1.1)])
+
+    # Hide unused subplots
+    for idx in range(n_minerals, len(axes)):
+        axes[idx].axis('off')
+
+    plt.tight_layout()
+    plot_path = os.path.join(plot_dir, 'mineral_spectra_individual.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  Saved: {}".format(plot_path))
+
+    # Plot 3: Hyperion RGB composite (bands as RGB)
+    print("Creating Hyperion RGB composite...")
+    # Select bands for RGB visualization (approximate true color)
+    # Red: ~650nm, Green: ~550nm, Blue: ~450nm
+    # For Hyperion, we'll use bands that approximate these
+
+    if cube.shape[2] >= 50:
+        # Use bands from the visible range
+        red_band = cube[:, :, min(30, cube.shape[2]-1)]
+        green_band = cube[:, :, min(20, cube.shape[2]-1)]
+        blue_band = cube[:, :, min(10, cube.shape[2]-1)]
+
+        # Normalize for display
+        def normalize_band(band):
+            valid = band[band > 0]
+            if len(valid) > 0:
+                p2, p98 = np.percentile(valid, [2, 98])
+                normalized = np.clip((band - p2) / (p98 - p2), 0, 1)
+                return normalized
+            return band
+
+        rgb = np.dstack([
+            normalize_band(red_band),
+            normalize_band(green_band),
+            normalize_band(blue_band)
+        ])
+
+        fig, ax = plt.subplots(figsize=(12, 10))
+        ax.imshow(rgb)
+        ax.set_title('Hyperion RGB Composite (Approximate True Color)',
+                     fontsize=14, fontweight='bold')
+        ax.axis('off')
+        plt.tight_layout()
+        plot_path = os.path.join(plot_dir, 'hyperion_rgb.png')
+        plt.savefig(plot_path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print("  Saved: {}".format(plot_path))
+
+    # Plot 4: Sample pixel spectra from different locations
+    print("Creating sample pixel spectra plot...")
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    # Sample 5 random valid pixels
+    valid_mask = np.any(cube > 0, axis=2)
+    valid_coords = np.argwhere(valid_mask)
+
+    if len(valid_coords) > 0:
+        sample_indices = np.random.choice(len(valid_coords),
+                                         min(5, len(valid_coords)),
+                                         replace=False)
+
+        for i, idx in enumerate(sample_indices):
+            row, col = valid_coords[idx]
+            pixel_spectrum = cube[row, col, :]
+            ax.plot(wavelengths[:len(pixel_spectrum)], pixel_spectrum,
+                   label='Pixel ({}, {})'.format(row, col),
+                   linewidth=1.5, alpha=0.7)
+
+        ax.set_xlabel('Wavelength (nm)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Reflectance', fontsize=12, fontweight='bold')
+        ax.set_title('Sample Hyperion Pixel Spectra', fontsize=14, fontweight='bold')
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plot_path = os.path.join(plot_dir, 'sample_pixel_spectra.png')
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print("  Saved: {}".format(plot_path))
+
+    # Plot 5: Mean spectrum of entire image vs minerals
+    print("Creating mean image spectrum comparison...")
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    # Calculate mean spectrum of all valid pixels
+    valid_pixels_array = cube[valid_mask]
+    mean_spectrum = np.mean(valid_pixels_array, axis=0)
+
+    ax.plot(wavelengths[:len(mean_spectrum)], mean_spectrum,
+           label='Mean Image Spectrum', linewidth=3, color='black', alpha=0.8)
+
+    # Overlay mineral spectra (lighter)
+    for idx, (mineral_name, spectrum) in enumerate(endmembers.items()):
+        ax.plot(wavelengths[:len(spectrum)], spectrum,
+               label=mineral_name, linewidth=1.5, alpha=0.5, color=colors[idx])
+
+    ax.set_xlabel('Wavelength (nm)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Reflectance', fontsize=12, fontweight='bold')
+    ax.set_title('Mean Hyperion Spectrum vs Mineral Endmembers',
+                 fontsize=14, fontweight='bold')
+    ax.legend(fontsize=9, loc='best')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plot_path = os.path.join(plot_dir, 'mean_spectrum_comparison.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  Saved: {}".format(plot_path))
+
+    print("\nAll diagnostic plots saved to: {}".format(plot_dir))
+    print("=" * 70 + "\n")
 
     # ========================================================================
     # STEP 3: Spectral Enhancement (Optional)
