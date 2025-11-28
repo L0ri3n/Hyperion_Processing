@@ -1,11 +1,10 @@
 # load_usgs_spectrum
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
 
 # CONFIGURATION: Path to minerals folder
-MINERALS_DIR = r"C:/Lorien/Archivos/TUBAF/1st_Semester/Remote_Sensing/PROCESSING_AND_POST/amd_mapping/data/spectral_library/usgs/ASCIIdata/ASCIIdata_splib07b_cvHYPERION/ChapterM_Minerals"
+MINERALS_DIR = r"C:\Lorien\Archivos\TUBAF\1st_Semester\Remote_Sensing\usgs\ASCIIdata\ASCIIdata_splib07b_cvHYPERION\ChapterM_Minerals"
 
 # CONFIGURATION: List of minerals to load
 # Add or remove mineral names as needed
@@ -20,25 +19,53 @@ MINERALS_TO_LOAD = [
     'Gypsum',
 ]
 
-def load_usgs_spectrum(filepath):
+def load_hyperion_wavelengths(wavelength_file):
     """
-    Load USGS spectral library file
+    Load Hyperion wavelengths from the wavelength file
 
-    USGS format (after header):
-    Column 1: Wavelength (micrometers or nanometers)
-    Column 2: Reflectance
+    Returns:
+        Wavelength array in nanometers
     """
-    # Read the file, skip header lines
-    data = pd.read_csv(filepath, sep='\s+', skiprows=18, header=None)
+    # Skip first line (header), then read all wavelength values
+    wavelengths = []
+    with open(wavelength_file, 'r') as f:
+        lines = f.readlines()[1:]  # Skip header
+        for line in lines:
+            wavelengths.append(float(line.strip()))
 
-    wavelength = data.iloc[:, 0].values
-    reflectance = data.iloc[:, 1].values
+    wavelengths = np.array(wavelengths)
 
-    # Convert to nm if in micrometers (check if max < 10)
-    if wavelength.max() < 10:
-        wavelength = wavelength * 1000  # Convert um to nm
+    # Convert micrometers to nanometers
+    if wavelengths.max() < 10:
+        wavelengths = wavelengths * 1000
 
-    return wavelength, reflectance
+    return wavelengths
+
+def load_usgs_spectrum(filepath, wavelengths):
+    """
+    Load USGS spectral library file (Hyperion format)
+
+    USGS Hyperion format:
+    - First line: header
+    - Remaining lines: reflectance values only (one per line)
+
+    Args:
+        filepath: Path to the spectrum file
+        wavelengths: Wavelength array (loaded separately)
+
+    Returns:
+        wavelength, reflectance arrays
+    """
+    # Read reflectance values, skip first line (header)
+    reflectance = []
+    with open(filepath, 'r') as f:
+        lines = f.readlines()[1:]  # Skip header
+        for line in lines:
+            reflectance.append(float(line.strip()))
+
+    reflectance = np.array(reflectance)
+
+    return wavelengths, reflectance
 
 def find_mineral_file(mineral_name, minerals_dir):
     """
@@ -74,6 +101,17 @@ def load_minerals_spectra(mineral_list=None, minerals_dir=MINERALS_DIR):
     if mineral_list is None:
         mineral_list = MINERALS_TO_LOAD
 
+    # Load wavelengths from the Hyperion wavelength file
+    wavelength_file = Path(minerals_dir).parent / "s07HYPRN_Hyperion_Wavelengths_microns_AVG_xtrack.txt"
+
+    try:
+        wavelengths = load_hyperion_wavelengths(str(wavelength_file))
+        print("Loaded {} wavelength points from {} to {} nm".format(
+            len(wavelengths), wavelengths.min(), wavelengths.max()))
+    except Exception as e:
+        print("[ERROR] Failed to load wavelength file: {}".format(e))
+        return {}
+
     spectra = {}
 
     for mineral in mineral_list:
@@ -81,7 +119,7 @@ def load_minerals_spectra(mineral_list=None, minerals_dir=MINERALS_DIR):
 
         if filepath:
             try:
-                wvl, ref = load_usgs_spectrum(filepath)
+                wvl, ref = load_usgs_spectrum(filepath, wavelengths)
                 spectra[mineral] = (wvl, ref)
                 print("[OK] Loaded: {} ({} points)".format(mineral, len(wvl)))
             except Exception as e:
@@ -110,5 +148,13 @@ if __name__ == "__main__":
         plt.title('Mineral Spectra from USGS Library')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        plt.savefig('outputs/figures/minerals_spectra.png', dpi=150, bbox_inches='tight')
+
+        # Create output directory in amd_mapping/data
+        import os
+        output_dir = '../data/outputs'
+        os.makedirs(output_dir, exist_ok=True)
+
+        output_file = os.path.join(output_dir, 'minerals_spectra.png')
+        plt.savefig(output_file, dpi=150, bbox_inches='tight')
+        print("\nPlot saved to: {}".format(output_file))
         plt.show()
