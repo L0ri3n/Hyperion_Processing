@@ -42,8 +42,8 @@ print("\n" + "-" * 70)
 print("TEST 1: Load Endmember Library")
 print("-" * 70)
 
-# Load endmember library
-library_path = './amd_mapping/data/outputs/test_endmember_library.csv'
+# Load endmember library (matched to Hyperion wavelengths)
+library_path = './amd_mapping/data/outputs/endmember_library_matched.csv'
 if os.path.exists(library_path):
     library_df = pd.read_csv(library_path, index_col=0)
     print(f"[OK] Loaded endmember library: {library_path}")
@@ -58,8 +58,8 @@ print("\n" + "-" * 70)
 print("TEST 2: Load Hyperion Data")
 print("-" * 70)
 
-# Try to load Hyperion cube from OUT directory
-hyperion_path = '../OUT/EO1H2020342016359110KF_reflectance.hdr'
+# Try to load Hyperion cube from amd_mapping/data/hyperion/
+hyperion_path = './amd_mapping/data/hyperion/EO1H2020342016359110KF_reflectance.hdr'
 if os.path.exists(hyperion_path):
     print(f"[OK] Found Hyperion file: {hyperion_path}")
     try:
@@ -119,7 +119,11 @@ try:
     print(f"\n[OK] SAM single mineral completed!")
     print(f"     Classification map shape: {class_map.shape}")
     print(f"     Angle map shape: {angle_map.shape}")
-    print(f"     Angle range: {angle_map[angle_map < np.pi].min():.3f} - {angle_map[angle_map < np.pi].max():.3f} rad")
+    valid_angles = angle_map[angle_map < np.pi]
+    if len(valid_angles) > 0:
+        print(f"     Angle range: {valid_angles.min():.3f} - {valid_angles.max():.3f} rad")
+    else:
+        print(f"     No valid angles (all pixels were invalid/zero)")
 
 except Exception as e:
     print(f"[ERROR] SAM single mineral failed: {e}")
@@ -180,10 +184,10 @@ print("All SAM tests completed!")
 print("=" * 70)
 
 print("\nSummary:")
-print("  ✓ SAM functions imported successfully")
-print("  ✓ Single mineral SAM working")
-print("  ✓ Multi-mineral SAM working")
-print("  ✓ Wrapper function working")
+print("  * SAM functions imported successfully")
+print("  * Single mineral SAM working")
+print("  * Multi-mineral SAM working")
+print("  * Wrapper function working")
 print("\nYou can now use these functions in your workflow!")
 print("\nNext steps:")
 print("  1. Run SAM on full Hyperion image")

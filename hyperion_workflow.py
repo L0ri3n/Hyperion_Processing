@@ -411,8 +411,14 @@ def run_sam_single_mineral(cube, endmember_spectrum, threshold=0.10):
     class_map = (angle_map < threshold).astype(np.uint8)
 
     print(f"Classified pixels: {class_map.sum()} ({class_map.sum()/class_map.size*100:.2f}%)")
-    print(f"Mean angle: {angle_map[angle_map < np.pi].mean():.3f} rad")
-    print(f"Min angle: {angle_map[angle_map < np.pi].min():.3f} rad")
+
+    # Only print angle statistics if there are valid pixels
+    valid_angles = angle_map[angle_map < np.pi]
+    if len(valid_angles) > 0:
+        print(f"Mean angle: {valid_angles.mean():.3f} rad")
+        print(f"Min angle: {valid_angles.min():.3f} rad")
+    else:
+        print("Warning: No valid pixels found (all pixels are zero/invalid)")
 
     return class_map, angle_map
 
@@ -1003,78 +1009,279 @@ def main_workflow():
     """
     Complete workflow from Step 2 onwards
     (Assuming Step 1 done with SUREHYP)
+
+    Configure which steps to run by setting True/False below
     """
 
-    print("=== STEP 2: Building Spectral Library ===")
+    # ========================================================================
+    # CONFIGURATION - Set True/False to enable/disable each step
+    # ========================================================================
 
-    # Option 1: Use USGS loader (automatic - recommended)
-    if USGS_LOADER_AVAILABLE:
-        endmembers, hyperion_wvl = create_endmember_library(
-            output_file='./amd_mapping/data/outputs/endmember_library.sli'
-        )
+    RUN_STEP_2_BUILD_LIBRARY = False      # Build spectral library (if not done)
+    RUN_STEP_3_ENHANCEMENT = False        # Spectral enhancement (smoothing, etc.)
+    RUN_STEP_4_SAM = True                 # SAM classification
+    RUN_STEP_5_MTMF = False               # MTMF abundance mapping
+    RUN_STEP_6_POSTPROCESSING = False     # Combine and clean results
+    RUN_STEP_7_VALIDATION = False         # Validation checks
+    RUN_STEP_8_EXPORT = True              # Export final products
 
-    # Option 2: Manual loading (if USGS loader not available)
+    # ========================================================================
+    # FILE PATHS - Update these paths for your data
+    # ========================================================================
+
+    # Input files
+    HYPERION_CUBE_PATH = './amd_mapping/data/hyperion/EO1H2020342016359110KF_reflectance.hdr'
+    ENDMEMBER_LIBRARY_PATH = './amd_mapping/data/outputs/endmember_library_matched.csv'
+
+    # Output directory
+    OUTPUT_DIR = './amd_mapping/outputs/classifications'
+
+    # SAM parameters
+    SAM_THRESHOLD = 0.40  # radians (smaller = more strict)
+
+    # Subset for testing (set to None to process full image)
+    # Format: ((row_start, row_end), (col_start, col_end))
+    PROCESS_SUBSET = None  # None = full image
+    # PROCESS_SUBSET = ((1000, 1500), (200, 700))  # Example subset
+
+    # ========================================================================
+    # WORKFLOW EXECUTION
+    # ========================================================================
+
+    print("=" * 70)
+    print("AMD MINERAL MAPPING WORKFLOW")
+    print("=" * 70)
+    print("\nConfiguration:")
+    print("  - Build Library: {}".format(RUN_STEP_2_BUILD_LIBRARY))
+    print("  - Enhancement: {}".format(RUN_STEP_3_ENHANCEMENT))
+    print("  - SAM Classification: {}".format(RUN_STEP_4_SAM))
+    print("  - MTMF: {}".format(RUN_STEP_5_MTMF))
+    print("  - Postprocessing: {}".format(RUN_STEP_6_POSTPROCESSING))
+    print("  - Validation: {}".format(RUN_STEP_7_VALIDATION))
+    print("  - Export: {}".format(RUN_STEP_8_EXPORT))
+    print("=" * 70)
+
+    # ========================================================================
+    # STEP 2: Build Spectral Library (Optional)
+    # ========================================================================
+
+    if RUN_STEP_2_BUILD_LIBRARY:
+        print("\n=== STEP 2: Building Spectral Library ===")
+
+        if USGS_LOADER_AVAILABLE:
+            endmembers, hyperion_wvl = create_endmember_library(
+                output_file='./amd_mapping/data/outputs/endmember_library.sli'
+            )
+        else:
+            hyperion_wvl = load_hyperion_wavelengths(HYPERION_CUBE_PATH)
+            endmembers, hyperion_wvl = create_endmember_library(
+                library_dir='./spectral_library/',
+                hyperion_wavelengths=hyperion_wvl,
+                output_file='./amd_mapping/data/outputs/endmember_library.sli'
+            )
+
+    # ========================================================================
+    # LOAD DATA
+    # ========================================================================
+
+    print("\n=== Loading Data ===")
+
+    # Load Hyperion cube
+    print("Loading Hyperion cube: {}".format(HYPERION_CUBE_PATH))
+    img = envi.open(HYPERION_CUBE_PATH)
+
+    if PROCESS_SUBSET is not None:
+        rows, cols = PROCESS_SUBSET
+        print("  Processing subset: rows {}-{}, cols {}-{}".format(
+            rows[0], rows[1], cols[0], cols[1]))
+        cube = img.read_subregion(rows, cols)
     else:
-        # Load Hyperion wavelengths from your image
-        hyperion_wvl = load_hyperion_wavelengths('hyperion_cube.hdr')
+        print("  Processing full image: {} x {} x {} bands".format(
+            img.nrows, img.ncols, img.nbands))
+        cube = img.load()
 
-        # Create endmember library from custom directory
-        endmembers, hyperion_wvl = create_endmember_library(
-            library_dir='./spectral_library/',
-            hyperion_wavelengths=hyperion_wvl,
-            output_file='./amd_mapping/data/outputs/endmember_library.sli'
+    print("  Cube shape: {}".format(cube.shape))
+
+    # Load endmember library
+    print("Loading endmember library: {}".format(ENDMEMBER_LIBRARY_PATH))
+    library_df = pd.read_csv(ENDMEMBER_LIBRARY_PATH, index_col=0)
+    endmembers = {name: library_df[name].values for name in library_df.columns}
+    print("  Loaded {} minerals: {}".format(len(endmembers), list(endmembers.keys())))
+
+    # ========================================================================
+    # STEP 3: Spectral Enhancement (Optional)
+    # ========================================================================
+
+    if RUN_STEP_3_ENHANCEMENT:
+        print("\n=== STEP 3: Enhancing Spectral Features ===")
+        print("Applying Savitzky-Golay smoothing...")
+        cube_smooth = apply_savgol_smoothing(cube)
+        print("  Done!")
+        # Use smoothed cube for classification
+        cube_for_sam = cube_smooth
+    else:
+        print("\n=== STEP 3: Spectral Enhancement SKIPPED ===")
+        # Use original cube
+        cube_for_sam = cube
+
+    # ========================================================================
+    # STEP 4: SAM Classification
+    # ========================================================================
+
+    class_map = None
+    angle_maps = None
+
+    if RUN_STEP_4_SAM:
+        print("\n=== STEP 4: Running SAM Classification ===")
+        print("Threshold: {} radians".format(SAM_THRESHOLD))
+
+        class_map, angle_maps = run_sam_all_minerals(
+            cube_for_sam,
+            endmembers,
+            threshold=SAM_THRESHOLD
         )
-    
-    print("=== STEP 3: Enhancing Spectral Features ===")
-    # Load preprocessed cube from Step 1
-    cube = envi.open('hyperion_cube.hdr').load()
-    
-    # Apply Savitzky-Golay smoothing
-    cube_smooth = apply_savgol_smoothing(cube)
-    
-    # Optional: Continuum removal
-    # cube_cr = apply_continuum_removal_cube(cube_smooth)
-    
-    print("=== STEP 4: Running SAM Classification ===")
-    class_map, angle_map = run_sam_classification(
-        cube_smooth, 
-        endmembers, 
-        threshold=0.10
-    )
-    
-    print("=== STEP 5: Running MTMF for Abundances ===")
+
+        print("\nSAM Classification completed!")
+    else:
+        print("\n=== STEP 4: SAM Classification SKIPPED ===")
+
+    # ========================================================================
+    # STEP 5: MTMF for Abundances (Optional)
+    # ========================================================================
+
     abundance_maps = {}
-    for mineral_name, spectrum in endmembers.items():
-        mf_score, infeas = run_mtmf(cube_smooth, spectrum)
-        abundance_maps[mineral_name] = {
-            'mf_score': mf_score,
-            'infeasibility': infeas
-        }
-    
-    print("=== STEP 6: Postprocessing ===")
+
+    if RUN_STEP_5_MTMF:
+        print("\n=== STEP 5: Running MTMF for Abundances ===")
+        for mineral_name, spectrum in endmembers.items():
+            print("  Processing {}...".format(mineral_name))
+            mf_score, infeas = run_mtmf(cube_for_sam, spectrum)
+            abundance_maps[mineral_name] = {
+                'mf_score': mf_score,
+                'infeasibility': infeas
+            }
+        print("MTMF completed!")
+    else:
+        print("\n=== STEP 5: MTMF SKIPPED ===")
+
+    # ========================================================================
+    # STEP 6: Postprocessing (Optional)
+    # ========================================================================
+
     refined_maps = {}
-    for mineral_name in endmembers.keys():
-        combined = combine_sam_mtmf(
-            sam_class=class_map,
-            sam_angle=angle_map[:,:,i],  # Index for this mineral
-            mtmf_score=abundance_maps[mineral_name]['mf_score'],
-            mtmf_infeasibility=abundance_maps[mineral_name]['infeasibility']
-        )
-        cleaned = clean_classification_map(combined)
-        refined_maps[mineral_name] = cleaned
-    
-    print("=== STEP 7: Validation ===")
-    # Load validation data
-    # Run consistency checks
-    
-    print("=== STEP 8: Final Outputs ===")
-    stats = generate_mineral_statistics(refined_maps, masks={})
-    print(stats)
-    
-    # Export all products
-    export_final_products(refined_maps, './final_outputs/')
-    
-    print("=== WORKFLOW COMPLETE ===")
+
+    if RUN_STEP_6_POSTPROCESSING:
+        print("\n=== STEP 6: Postprocessing ===")
+
+        if class_map is not None and abundance_maps:
+            for idx, mineral_name in enumerate(endmembers.keys(), 1):
+                print("  Cleaning {}...".format(mineral_name))
+                combined = combine_sam_mtmf(
+                    sam_class=class_map,
+                    sam_angle=angle_maps[mineral_name],
+                    mtmf_score=abundance_maps[mineral_name]['mf_score'],
+                    mtmf_infeasibility=abundance_maps[mineral_name]['infeasibility']
+                )
+                cleaned = clean_classification_map(combined)
+                refined_maps[mineral_name] = cleaned
+            print("Postprocessing completed!")
+        else:
+            print("  Skipping - need both SAM and MTMF results")
+    else:
+        print("\n=== STEP 6: Postprocessing SKIPPED ===")
+
+    # ========================================================================
+    # STEP 7: Validation (Optional)
+    # ========================================================================
+
+    if RUN_STEP_7_VALIDATION:
+        print("\n=== STEP 7: Validation ===")
+        print("  Load validation data here...")
+        print("  Run consistency checks here...")
+    else:
+        print("\n=== STEP 7: Validation SKIPPED ===")
+
+    # ========================================================================
+    # STEP 8: Export Results
+    # ========================================================================
+
+    if RUN_STEP_8_EXPORT:
+        print("\n=== STEP 8: Exporting Results ===")
+
+        import os
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+        # Prepare metadata from original image
+        metadata = img.metadata.copy()
+
+        # Export SAM results
+        if class_map is not None:
+            print("Exporting SAM classification map...")
+            output_path = os.path.join(OUTPUT_DIR, 'sam_multiclass.hdr')
+            envi.save_image(output_path, class_map, metadata=metadata, force=True)
+            print("  Saved: {}".format(output_path))
+
+            # Export individual angle maps
+            print("Exporting individual angle maps...")
+            for mineral_name, angle_map in angle_maps.items():
+                output_path = os.path.join(OUTPUT_DIR, 'sam_angle_{}.hdr'.format(mineral_name))
+                envi.save_image(output_path, angle_map, metadata=metadata, force=True)
+                print("  Saved: {}".format(output_path))
+
+        # Export MTMF results
+        if abundance_maps:
+            print("Exporting MTMF abundance maps...")
+            for mineral_name, maps in abundance_maps.items():
+                output_path = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}.hdr'.format(mineral_name))
+                envi.save_image(output_path, maps['mf_score'], metadata=metadata, force=True)
+                print("  Saved: {}".format(output_path))
+
+        # Export refined maps
+        if refined_maps:
+            print("Exporting refined classification maps...")
+            for mineral_name, refined_map in refined_maps.items():
+                output_path = os.path.join(OUTPUT_DIR, 'refined_{}.hdr'.format(mineral_name))
+                envi.save_image(output_path, refined_map, metadata=metadata, force=True)
+                print("  Saved: {}".format(output_path))
+
+        # Generate and save statistics
+        if class_map is not None:
+            print("\nGenerating classification statistics...")
+            stats_data = []
+            total_pixels = class_map.size
+
+            # Unclassified pixels
+            unclassified = np.sum(class_map == 0)
+            stats_data.append({
+                'Class': 'Unclassified',
+                'Code': 0,
+                'Pixels': unclassified,
+                'Percent': (unclassified / total_pixels) * 100
+            })
+
+            # Each mineral class
+            for idx, mineral_name in enumerate(endmembers.keys(), 1):
+                count = np.sum(class_map == idx)
+                stats_data.append({
+                    'Class': mineral_name,
+                    'Code': idx,
+                    'Pixels': count,
+                    'Percent': (count / total_pixels) * 100
+                })
+
+            stats_df = pd.DataFrame(stats_data)
+            stats_path = os.path.join(OUTPUT_DIR, 'classification_statistics.csv')
+            stats_df.to_csv(stats_path, index=False)
+            print("  Saved statistics: {}".format(stats_path))
+            print("\n{}".format(stats_df.to_string(index=False)))
+
+        print("\nAll results exported to: {}".format(OUTPUT_DIR))
+    else:
+        print("\n=== STEP 8: Export SKIPPED ===")
+
+    print("\n" + "=" * 70)
+    print("WORKFLOW COMPLETE!")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main_workflow()
