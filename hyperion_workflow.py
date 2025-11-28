@@ -31,14 +31,39 @@ import numpy as np
 import pandas as pd
 from spectral import *
 import matplotlib.pyplot as plt
+import sys
+import os
+
+# Add the code directory to path to import our USGS loader
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'amd_mapping', 'code'))
+
+# Import USGS spectral library functions
+try:
+    from load_usgs_spectrum import load_minerals_spectra
+    USGS_LOADER_AVAILABLE = True
+except ImportError:
+    USGS_LOADER_AVAILABLE = False
+    print("[WARNING] USGS loader not available. Using fallback methods.")
 
 def download_usgs_library():
     """
-    Manual download from USGS website or use their API
-    Files typically named: mineral_name.txt
-    Format: wavelength(nm), reflectance
+    Load USGS spectral library using the custom loader
+
+    The loader automatically:
+    - Loads Hyperion wavelengths from the USGS library
+    - Searches for mineral files by name (case-insensitive)
+    - Returns dict of {mineral_name: (wavelength, reflectance)}
+
+    To customize minerals, edit MINERALS_TO_LOAD in load_usgs_spectrum.py
     """
-    pass
+    if not USGS_LOADER_AVAILABLE:
+        print("[ERROR] USGS loader module not found")
+        return {}
+
+    # Load minerals using the custom loader
+    spectra = load_minerals_spectra()
+
+    return spectra
 
 # Step 2.2: Collect AMD-Specific Spectra from Publications
 # ----------------------------------------------------------
@@ -121,47 +146,84 @@ def resample_spectrum_to_hyperion(lib_wavelengths, lib_reflectance,
     resampled = np.interp(hyperion_wavelengths, lib_wavelengths, lib_reflectance)
     return resampled
 
-def create_endmember_library(library_dir, hyperion_wavelengths, output_file):
+def create_endmember_library(library_dir=None, hyperion_wavelengths=None, output_file=None):
     """
     Process all library spectra and save as Hyperion-compatible library
-    
+
     Parameters:
     -----------
-    library_dir : str
-        Directory containing library spectra files
-    hyperion_wavelengths : array
-        Hyperion wavelengths for resampling
+    library_dir : str, optional
+        Directory containing library spectra files (ignored if using USGS loader)
+    hyperion_wavelengths : array, optional
+        Hyperion wavelengths for resampling (USGS loader provides its own)
     output_file : str
         Output file for endmember library (.sli or .csv)
+
+    Returns:
+    --------
+    endmembers : dict
+        Dictionary with {mineral_name: reflectance_array}
+    wavelengths : array
+        Corresponding wavelengths
     """
-    import os
-    import glob
-    
-    endmembers = {}
-    
-    # Process each spectrum file
-    for filepath in glob.glob(os.path.join(library_dir, '*.txt')):
-        mineral_name = os.path.basename(filepath).replace('.txt', '')
-        
-        # Load spectrum (adjust format as needed)
-        data = np.loadtxt(filepath, skiprows=1)
-        lib_wvl = data[:, 0]
-        lib_ref = data[:, 1]
-        
-        # Resample to Hyperion
-        resampled = resample_spectrum_to_hyperion(lib_wvl, lib_ref, 
-                                                   hyperion_wavelengths)
-        endmembers[mineral_name] = resampled
-    
-    # Save as spectral library
-    # Format 1: CSV for easy viewing
-    df = pd.DataFrame(endmembers, index=hyperion_wavelengths)
-    df.to_csv(output_file.replace('.sli', '.csv'))
-    
-    # Format 2: ENVI spectral library format
-    save_envi_library(endmembers, hyperion_wavelengths, output_file)
-    
-    return endmembers
+
+    # Method 1: Use USGS loader (preferred)
+    if USGS_LOADER_AVAILABLE and library_dir is None:
+        print("Loading USGS spectral library with built-in loader...")
+        spectra_dict = load_minerals_spectra()
+
+        if not spectra_dict:
+            print("[ERROR] No spectra loaded")
+            return {}, np.array([])
+
+        # Extract wavelengths (same for all minerals)
+        wavelengths = list(spectra_dict.values())[0][0]
+
+        # Create endmember dict with just reflectance values
+        endmembers = {}
+        for mineral_name, (wvl, ref) in spectra_dict.items():
+            endmembers[mineral_name] = ref
+
+        print("Loaded {} minerals with {} bands".format(len(endmembers), len(wavelengths)))
+
+    # Method 2: Fallback to manual loading
+    else:
+        print("Using manual spectral library loading...")
+        import glob
+
+        if library_dir is None or hyperion_wavelengths is None:
+            print("[ERROR] library_dir and hyperion_wavelengths required for manual loading")
+            return {}, np.array([])
+
+        endmembers = {}
+        wavelengths = hyperion_wavelengths
+
+        # Process each spectrum file
+        for filepath in glob.glob(os.path.join(library_dir, '*.txt')):
+            mineral_name = os.path.basename(filepath).replace('.txt', '')
+
+            # Load spectrum (adjust format as needed)
+            data = np.loadtxt(filepath, skiprows=1)
+            lib_wvl = data[:, 0]
+            lib_ref = data[:, 1]
+
+            # Resample to Hyperion
+            resampled = resample_spectrum_to_hyperion(lib_wvl, lib_ref,
+                                                       hyperion_wavelengths)
+            endmembers[mineral_name] = resampled
+
+    # Save library if output file specified
+    if output_file is not None:
+        # Format 1: CSV for easy viewing
+        df = pd.DataFrame(endmembers, index=wavelengths)
+        df.to_csv(output_file.replace('.sli', '.csv'))
+        print("Saved CSV library to: {}".format(output_file.replace('.sli', '.csv')))
+
+        # Format 2: ENVI spectral library format
+        save_envi_library(endmembers, wavelengths, output_file)
+        print("Saved ENVI library to: {}".format(output_file))
+
+    return endmembers, wavelengths
 
 def save_envi_library(endmembers, wavelengths, output_file):
     """
@@ -278,18 +340,150 @@ def apply_continuum_removal_cube(cube):
 
 """
 GOAL: Classify pixels based on spectral similarity to endmembers
-TOOLS: Python (pysptools), QGIS (OTB), or SNAP
+TOOLS: Python (spectral, numpy)
 OUTPUT: SAM classification maps for each mineral
 """
 
 # Method 1: Python implementation (recommended for automation)
 # -------------------------------------------------------------
-from pysptools.classification import SAM
+
+def spectral_angle(pixel, endmember):
+    """
+    Compute spectral angle in radians
+
+    Parameters:
+    -----------
+    pixel : array
+        Pixel spectrum
+    endmember : array
+        Endmember spectrum
+
+    Returns:
+    --------
+    angle : float
+        Spectral angle in radians
+    """
+    dot_product = np.dot(pixel, endmember)
+    norm_product = np.linalg.norm(pixel) * np.linalg.norm(endmember)
+
+    # Avoid division by zero and numerical errors
+    if norm_product == 0:
+        return np.pi  # Maximum angle
+
+    cos_angle = np.clip(dot_product / norm_product, -1, 1)
+    return np.arccos(cos_angle)
+
+def run_sam_single_mineral(cube, endmember_spectrum, threshold=0.10):
+    """
+    Run SAM for single mineral
+
+    Parameters:
+    -----------
+    cube : array (rows, cols, bands)
+        Preprocessed Hyperion cube
+    endmember_spectrum : array (bands,)
+        Target mineral spectrum
+    threshold : float (default=0.10)
+        Maximum angle in radians for classification
+
+    Returns:
+    --------
+    class_map : array (rows, cols)
+        1 = classified as mineral, 0 = not classified
+    angle_map : array (rows, cols)
+        Spectral angle in radians
+    """
+    rows, cols, bands = cube.shape
+    angle_map = np.zeros((rows, cols), dtype=np.float32)
+
+    print(f"Processing {rows} × {cols} pixels...")
+    for i in range(rows):
+        if i % 50 == 0:
+            print(f"  Row {i}/{rows}")
+        for j in range(cols):
+            pixel = cube[i, j, :]
+            if np.any(pixel > 0):  # Valid pixel
+                angle_map[i, j] = spectral_angle(pixel, endmember_spectrum)
+            else:
+                angle_map[i, j] = np.pi  # Invalid
+
+    # Classify based on threshold
+    class_map = (angle_map < threshold).astype(np.uint8)
+
+    print(f"Classified pixels: {class_map.sum()} ({class_map.sum()/class_map.size*100:.2f}%)")
+    print(f"Mean angle: {angle_map[angle_map < np.pi].mean():.3f} rad")
+    print(f"Min angle: {angle_map[angle_map < np.pi].min():.3f} rad")
+
+    return class_map, angle_map
+
+def run_sam_all_minerals(cube, endmember_dict, threshold=0.10):
+    """
+    Run SAM for all minerals and create multi-class map
+
+    Parameters:
+    -----------
+    cube : array (rows, cols, bands)
+        Preprocessed Hyperion cube
+    endmember_dict : dict
+        Dictionary with {mineral_name: endmember_spectrum}
+    threshold : float (default=0.10)
+        Maximum angle in radians for classification
+
+    Returns:
+    --------
+    class_map : array (rows, cols)
+        0 = unclassified, 1-N = mineral classes
+    angle_maps : dict
+        Dictionary of angle maps for each mineral
+    """
+    rows, cols, bands = cube.shape
+    n_minerals = len(endmember_dict)
+
+    # Compute angle maps for all minerals
+    angle_maps = {}
+    print("Computing spectral angles...")
+
+    for mineral_name, endmember in endmember_dict.items():
+        print(f"  Processing {mineral_name}...")
+        angle_map = np.zeros((rows, cols), dtype=np.float32)
+
+        for i in range(rows):
+            if i % 50 == 0:
+                print(f"    Row {i}/{rows}")
+            for j in range(cols):
+                pixel = cube[i, j, :]
+                if np.any(pixel > 0):
+                    angle_map[i, j] = spectral_angle(pixel, endmember)
+                else:
+                    angle_map[i, j] = np.pi
+
+        angle_maps[mineral_name] = angle_map
+
+    # Create classification map (assign to closest mineral if < threshold)
+    print("Creating classification map...")
+    class_map = np.zeros((rows, cols), dtype=np.uint8)
+    min_angles = np.full((rows, cols), np.pi)
+
+    for idx, (mineral_name, angle_map) in enumerate(angle_maps.items(), 1):
+        # Update classification where this mineral has minimum angle
+        mask = (angle_map < min_angles) & (angle_map < threshold)
+        class_map[mask] = idx
+        min_angles[mask] = angle_map[mask]
+
+    # Print statistics
+    print("\nClassification results:")
+    print(f"Unclassified: {np.sum(class_map == 0)} pixels")
+    for idx, mineral_name in enumerate(endmember_dict.keys(), 1):
+        count = np.sum(class_map == idx)
+        pct = count / class_map.size * 100
+        print(f"{mineral_name}: {count} pixels ({pct:.2f}%)")
+
+    return class_map, angle_maps
 
 def run_sam_classification(cube, endmembers, threshold=0.10):
     """
-    Run Spectral Angle Mapper classification
-    
+    Run Spectral Angle Mapper classification (wrapper function for compatibility)
+
     Parameters:
     -----------
     cube : array (rows, cols, bands)
@@ -298,54 +492,22 @@ def run_sam_classification(cube, endmembers, threshold=0.10):
         Endmember spectra (minerals)
     threshold : float (default=0.10)
         Maximum angle in radians for classification
-    
+
     Returns:
     --------
     class_map : array (rows, cols)
         Classification map (0=unclassified, 1-N=mineral classes)
-    angle_map : array (rows, cols, n_endmembers)
-        Spectral angle for each endmember
+    angle_maps : dict or array
+        Spectral angle maps for each endmember
     """
-    # Convert endmembers dict to array if needed
+    # Use improved implementation based on input type
     if isinstance(endmembers, dict):
-        E = np.array([endmembers[name] for name in endmembers.keys()])
+        return run_sam_all_minerals(cube, endmembers, threshold)
     else:
-        E = endmembers
-    
-    # Run SAM
-    sam = SAM()
-    class_map = sam.classify(cube, E, threshold)
-    
-    # Get angle maps
-    angle_map = compute_sam_angles(cube, E)
-    
-    return class_map, angle_map
-
-def compute_sam_angles(cube, endmembers):
-    """
-    Compute spectral angle between each pixel and each endmember
-    
-    Returns:
-    --------
-    angles : array (rows, cols, n_endmembers)
-        Angle in radians for each endmember
-    """
-    rows, cols, bands = cube.shape
-    n_endmembers = endmembers.shape[0]
-    angles = np.zeros((rows, cols, n_endmembers))
-    
-    for i in range(rows):
-        for j in range(cols):
-            pixel = cube[i, j, :]
-            for k in range(n_endmembers):
-                endmember = endmembers[k, :]
-                # Spectral angle formula
-                angles[i, j, k] = np.arccos(
-                    np.dot(pixel, endmember) / 
-                    (np.linalg.norm(pixel) * np.linalg.norm(endmember))
-                )
-    
-    return angles
+        # Convert array to dict if needed
+        endmember_dict = {f"mineral_{i+1}": endmembers[i]
+                          for i in range(endmembers.shape[0])}
+        return run_sam_all_minerals(cube, endmember_dict, threshold)
 
 # Method 2: QGIS with OTB (Orfeo ToolBox)
 # ----------------------------------------
@@ -842,17 +1004,26 @@ def main_workflow():
     Complete workflow from Step 2 onwards
     (Assuming Step 1 done with SUREHYP)
     """
-    
+
     print("=== STEP 2: Building Spectral Library ===")
-    # Load Hyperion wavelengths
-    hyperion_wvl = load_hyperion_wavelengths('hyperion_cube.hdr')
-    
-    # Create endmember library
-    endmembers = create_endmember_library(
-        library_dir='./spectral_library/',
-        hyperion_wavelengths=hyperion_wvl,
-        output_file='./outputs/endmember_library.sli'
-    )
+
+    # Option 1: Use USGS loader (automatic - recommended)
+    if USGS_LOADER_AVAILABLE:
+        endmembers, hyperion_wvl = create_endmember_library(
+            output_file='./amd_mapping/data/outputs/endmember_library.sli'
+        )
+
+    # Option 2: Manual loading (if USGS loader not available)
+    else:
+        # Load Hyperion wavelengths from your image
+        hyperion_wvl = load_hyperion_wavelengths('hyperion_cube.hdr')
+
+        # Create endmember library from custom directory
+        endmembers, hyperion_wvl = create_endmember_library(
+            library_dir='./spectral_library/',
+            hyperion_wavelengths=hyperion_wvl,
+            output_file='./amd_mapping/data/outputs/endmember_library.sli'
+        )
     
     print("=== STEP 3: Enhancing Spectral Features ===")
     # Load preprocessed cube from Step 1
