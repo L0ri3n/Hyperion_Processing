@@ -16,7 +16,7 @@ OUTPUT: Resampled endmember spectra at Hyperion wavelengths
 
 # Step 2.1: Download USGS Spectral Library
 # ------------------------------------------
-# Source: https://www.usgs.gov/labs/spec-lab/capabilities/spectral-library
+# Source: https://www.usgs.gov/labs/spec-lab/capabilities/spectral-library (Kokaly, R.F., Clark, R.N., Swayze, G.A., Livo, K.E., Hoefen, T.M., Pearson, N.C., Wise, R.A., Benzel, W.M., Lowers, H.A., Driscoll, R.L., and Klein, A.J., 2017, USGS Spectral Library Version 7 Data: U.S. Geological Survey data release, https://doi.org/10.5066/F7RR1WDJ.)
 # Required minerals:
 # - Jarosite (various types: K-jarosite, Na-jarosite, H3O-jarosite)
 # - Goethite
@@ -404,7 +404,8 @@ OUTPUT: Abundance maps showing mineral likelihood
 """
 
 from pysptools.abundance_maps import FCLS, NNLS
-from pysptools.detection import MTMF, MatchedFilter
+from pysptools.detection import MatchedFilter
+# Note: MTMF is implemented manually below (not in pysptools 0.15.0)
 
 # Step 5.1: Matched Filter (MF)
 # ------------------------------
@@ -433,7 +434,8 @@ def run_matched_filter(cube, endmember_spectrum):
 def run_mtmf(cube, endmember_spectrum):
     """
     Run MTMF for more robust detection with infeasibility metric
-    
+    Uses Matched Filter + infeasibility calculation
+
     Returns:
     --------
     mf_score : array (rows, cols)
@@ -441,8 +443,27 @@ def run_mtmf(cube, endmember_spectrum):
     infeasibility : array (rows, cols)
         Infeasibility metric (lower = more feasible)
     """
-    mtmf = MTMF()
-    mf_score, infeasibility = mtmf.map(cube, endmember_spectrum)
+    # Run matched filter first
+    mf = MatchedFilter()
+    mf_score = mf.map(cube, endmember_spectrum)
+
+    # Calculate infeasibility (simplified implementation)
+    # Infeasibility measures how well pixel fits as mixture of target + background
+    rows, cols, bands = cube.shape
+    infeasibility = np.zeros((rows, cols))
+
+    # Normalize endmember
+    target = endmember_spectrum / np.linalg.norm(endmember_spectrum)
+
+    for i in range(rows):
+        for j in range(cols):
+            pixel = cube[i, j, :]
+            if np.linalg.norm(pixel) > 0:
+                pixel_norm = pixel / np.linalg.norm(pixel)
+                # Infeasibility as orthogonal distance
+                projection = np.dot(pixel_norm, target) * target
+                infeasibility[i, j] = np.linalg.norm(pixel_norm - projection)
+
     return mf_score, infeasibility
 
 # Step 5.3: Linear Spectral Unmixing
