@@ -1,0 +1,8 @@
+# Large data files - Hyperion imagery
+*.img
+
+# Numpy arrays
+*.npy
+
+# Backup files
+*.backup

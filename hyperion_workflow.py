@@ -1002,6 +1002,60 @@ def export_final_products(results_dict, output_dir):
 
 
 # ============================================================================
+# DATA VALIDATION FUNCTION
+# ============================================================================
+
+def validate_sam_inputs(cube, endmembers):
+    """
+    Validate inputs before running SAM
+    Returns: (is_valid, error_message)
+    """
+
+    # Check 1: Band counts
+    cube_bands = cube.shape[2]
+    endmember_bands = len(list(endmembers.values())[0])
+
+    if cube_bands != endmember_bands:
+        return False, "Band mismatch: cube={}, endmembers={}".format(cube_bands, endmember_bands)
+
+    # Check 2: Valid pixels exist
+    valid_pixels = np.sum(np.any(cube > 0, axis=2))
+    total_pixels = cube.shape[0] * cube.shape[1]
+    valid_pct = (valid_pixels / total_pixels) * 100
+
+    if valid_pixels == 0:
+        return False, "No valid pixels in cube (all zeros)"
+
+    if valid_pct < 1:
+        print("WARNING: Only {:.2f}% of pixels are valid".format(valid_pct))
+
+    # Check 3: Scales look reasonable
+    cube_valid = cube[cube > 0]
+    cube_max = np.max(cube_valid)
+    em_max = max(np.max(spec) for spec in endmembers.values())
+
+    if cube_max > 2.0 or em_max > 2.0:
+        return False, "Scale issue detected: cube_max={:.2f}, em_max={:.2f}".format(cube_max, em_max)
+
+    # Check 4: Test spectral angle calculation
+    test_pixel = cube[cube.shape[0]//2, cube.shape[1]//2, :]
+    if np.any(test_pixel > 0):
+        test_em = list(endmembers.values())[0]
+
+        dot = np.dot(test_pixel, test_em)
+        norm_p = np.linalg.norm(test_pixel)
+        norm_e = np.linalg.norm(test_em)
+
+        if norm_p > 0 and norm_e > 0:
+            cos_angle = dot / (norm_p * norm_e)
+
+            if abs(cos_angle) > 1.0:
+                return False, "Invalid cosine: {:.6f} (scale mismatch!)".format(cos_angle)
+
+    return True, "All validation checks passed"
+
+
+# ============================================================================
 # MAIN WORKFLOW EXECUTION
 # ============================================================================
 
@@ -1121,86 +1175,79 @@ def main_workflow():
     print("  Loaded {} minerals: {}".format(len(endmembers), list(endmembers.keys())))
 
     # ========================================================================
-    # CRITICAL DIAGNOSTIC: Check band counts and scales
+    # CRITICAL FIX: Scale and Band Alignment (from SAM_Implementation_Report.md)
     # ========================================================================
-    print("\n" + "=" * 70)
-    print("CRITICAL DIAGNOSTIC CHECKS")
-    print("=" * 70)
 
-    # Check 1: Band counts
+    print("\n" + "="*70)
+    print("APPLYING DATA CORRECTIONS")
+    print("="*70)
+
+    # Fix 1: Scale correction
+    cube_valid = cube[cube > 0]
+    if len(cube_valid) > 0:
+        cube_max = np.max(cube_valid)
+        cube_min = np.min(cube_valid)
+        cube_mean = np.mean(cube_valid)
+
+        print("\nCube statistics (valid pixels only):")
+        print("  Min: {:.6f}".format(cube_min))
+        print("  Max: {:.6f}".format(cube_max))
+        print("  Mean: {:.6f}".format(cube_mean))
+
+        if cube_max > 10000:
+            cube = cube / 65535.0
+            print("[OK] Corrected cube scale: /65535")
+        elif cube_max > 2.0:
+            cube = cube / 10000.0
+            print("[OK] Corrected cube scale: /10000")
+        else:
+            print("[OK] Cube scale OK")
+
+    em_max = max(np.max(spec) for spec in endmembers.values())
+    em_min = min(np.min(spec) for spec in endmembers.values())
+    em_mean = np.mean([np.mean(spec) for spec in endmembers.values()])
+
+    print("\nEndmember statistics:")
+    print("  Min: {:.6f}".format(em_min))
+    print("  Max: {:.6f}".format(em_max))
+    print("  Mean: {:.6f}".format(em_mean))
+
+    if em_max > 2.0:
+        endmembers = {name: spec / 10000.0 for name, spec in endmembers.items()}
+        print("[OK] Corrected endmember scale: /10000")
+    else:
+        print("[OK] Endmember scale OK")
+
+    # Fix 2: Band alignment
     cube_bands = cube.shape[2]
     endmember_bands = len(list(endmembers.values())[0])
-    print("\n1. BAND COUNT CHECK:")
+
+    print("\nBand alignment check:")
     print("  Cube bands: {}".format(cube_bands))
     print("  Endmember bands: {}".format(endmember_bands))
 
     if cube_bands != endmember_bands:
-        print("  *** CRITICAL ERROR: Band mismatch!")
-        print("  SAM CANNOT WORK with different band counts!")
-        print("\n  Need to match the bands...")
-
-        # Try to match by trimming cube to endmember length
         if cube_bands > endmember_bands:
-            print("  Trimming cube from {} to {} bands".format(cube_bands, endmember_bands))
             cube = cube[:, :, :endmember_bands]
-            print("  New cube shape: {}".format(cube.shape))
+            print("[OK] Trimmed cube bands: {} -> {}".format(cube_bands, endmember_bands))
         else:
-            print("  ERROR: Cube has fewer bands than endmembers!")
-            print("  Cannot proceed - check your endmember library file")
+            print("[ERROR] Cannot proceed (cube bands < endmember bands)")
+            sys.exit(1)
     else:
-        print("  [OK] Band counts match!")
+        print("[OK] Band counts match")
 
-    # Check 2: Scale validation
-    cube_max = np.max(cube[cube > 0]) if np.any(cube > 0) else 0
-    cube_min = np.min(cube[cube > 0]) if np.any(cube > 0) else 0
-    endmember_max = max(np.max(spec) for spec in endmembers.values())
-    endmember_min = min(np.min(spec) for spec in endmembers.values())
-
-    print("\n2. SCALE CHECK:")
-    print("  Cube range: {:.6f} to {:.6f}".format(cube_min, cube_max))
-    print("  Endmember range: {:.6f} to {:.6f}".format(endmember_min, endmember_max))
-
-    if cube_max > 2.0 or endmember_max > 2.0:
-        print("  [WARNING] Values > 2.0 detected (should be 0-1 reflectance)")
-        if cube_max > 2.0:
-            print("  Applying scale correction to cube...")
-            # Check if values are in 0-65535 range (16-bit) or 0-10000 range
-            if cube_max > 10000:
-                print("  Detected 16-bit scale (0-65535), dividing by 65535...")
-                cube = cube / 65535.0
-            else:
-                print("  Detected 10000 scale, dividing by 10000...")
-                cube = cube / 10000.0
-            print("  Cube range after scaling: {:.6f} to {:.6f}".format(np.min(cube), np.max(cube)))
-        if endmember_max > 2.0:
-            print("  Applying scale correction to endmembers...")
-            endmembers = {name: spec / 10000.0 for name, spec in endmembers.items()}
-            endmember_max = max(np.max(spec) for spec in endmembers.values())
-            print("  Endmember range after scaling: {:.6f} to {:.6f}".format(endmember_min, endmember_max))
-    else:
-        print("  [OK] Scales look correct (0-1 range)")
-
-    # Check 3: Valid pixels
+    # Fix 3: Validation
     valid_pixels = np.sum(np.any(cube > 0, axis=2))
     total_pixels = cube.shape[0] * cube.shape[1]
-    print("\n3. DATA VALIDITY CHECK:")
-    print("  Valid pixels: {:,} / {:,} ({:.1f}%)".format(
-        valid_pixels, total_pixels, valid_pixels/total_pixels*100))
+    print("[OK] Valid pixels: {:,} ({:.1f}%)".format(valid_pixels, valid_pixels/total_pixels*100))
 
-    if valid_pixels == 0:
-        print("  *** CRITICAL ERROR: No valid pixels!")
-        print("  Cannot proceed - check your Hyperion data file")
-    else:
-        print("  [OK] Data contains valid pixels")
-
-    # Check 4: Manual spectral angle test
-    print("\n4. MANUAL SPECTRAL ANGLE TEST:")
+    # Fix 4: Manual spectral angle test
+    print("\nManual spectral angle test:")
     test_row, test_col = cube.shape[0]//2, cube.shape[1]//2
     test_pixel = cube[test_row, test_col, :]
 
     if np.any(test_pixel > 0):
         print("  Testing pixel at ({}, {})".format(test_row, test_col))
-        print("  Pixel range: {:.6f} to {:.6f}".format(np.min(test_pixel), np.max(test_pixel)))
 
         for mineral_name in list(endmembers.keys())[:3]:  # Test first 3 minerals
             test_endmember = endmembers[mineral_name]
@@ -1210,22 +1257,19 @@ def main_workflow():
 
             if norm_p > 0 and norm_e > 0:
                 cos_angle = dot / (norm_p * norm_e)
-                print("\n  {} vs {}:".format("Test pixel", mineral_name))
-                print("    cos(angle) = {:.6f}".format(cos_angle))
 
-                if cos_angle > 1.0 or cos_angle < -1.0:
-                    print("    *** INVALID! Scale mismatch detected!")
+                if abs(cos_angle) > 1.0:
+                    print("  {} vs {}: [ERROR] INVALID cosine ({:.6f}) - Scale mismatch!".format(
+                        "Test pixel", mineral_name, cos_angle))
                 else:
                     angle = np.arccos(cos_angle)
-                    print("    angle = {:.4f} rad ({:.1f} deg)".format(angle, np.degrees(angle)))
-                    if angle < SAM_THRESHOLD:
-                        print("    [OK] Would classify at threshold {:.2f}".format(SAM_THRESHOLD))
-                    else:
-                        print("    [NO] Would not classify (threshold {:.2f})".format(SAM_THRESHOLD))
+                    print("  {} vs {}: {:.4f} rad ({:.1f} deg){}".format(
+                        "Test pixel", mineral_name, angle, np.degrees(angle),
+                        " [OK]" if angle < SAM_THRESHOLD else ""))
     else:
         print("  Test pixel is invalid (all zeros)")
 
-    print("=" * 70 + "\n")
+    print("="*70 + "\n")
 
     # ========================================================================
     # VISUALIZATION: Plot mineral spectra and Hyperion data
@@ -1424,6 +1468,15 @@ def main_workflow():
     if RUN_STEP_4_SAM:
         print("\n=== STEP 4: Running SAM Classification ===")
         print("Threshold: {} radians".format(SAM_THRESHOLD))
+
+        # Validate inputs before running SAM
+        print("\nValidating SAM inputs...")
+        is_valid, message = validate_sam_inputs(cube_for_sam, endmembers)
+        print("Validation: {}".format(message))
+
+        if not is_valid:
+            print("STOPPING - Fix data issues before running SAM")
+            sys.exit(1)
 
         class_map, angle_maps = run_sam_all_minerals(
             cube_for_sam,
