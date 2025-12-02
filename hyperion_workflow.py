@@ -223,34 +223,201 @@ def create_endmember_library(library_dir=None, hyperion_wavelengths=None, output
         save_envi_library(endmembers, wavelengths, output_file)
         print("Saved ENVI library to: {}".format(output_file))
 
+        # Validate the saved library
+        print("\nValidating ENVI library format...")
+        output_hdr = output_file if output_file.endswith('.hdr') else output_file + '.hdr'
+        if validate_envi_library(output_hdr):
+            print("[SUCCESS] Library is valid and SNAP-compatible")
+        else:
+            print("[WARNING] Library may have compatibility issues")
+            print("  Trying alternative save method...")
+            save_envi_library_alternative(endmembers, wavelengths, output_file)
+            if validate_envi_library(output_hdr):
+                print("[SUCCESS] Alternative method succeeded")
+            else:
+                print("[ERROR] Both methods failed - manual inspection required")
+
     return endmembers, wavelengths
 
 def save_envi_library(endmembers, wavelengths, output_file):
     """
-    Save endmembers in ENVI spectral library format
+    Save endmembers in ENVI spectral library format (SNAP-compatible)
+
+    ENVI Spectral Library Format:
+    - Data: (lines=1, samples=n_bands, bands=n_endmembers)
+    - Each band represents one endmember spectrum
+    - BIL (band interleave by line) is standard for spectral libraries
     """
+    import sys
+
     n_endmembers = len(endmembers)
     n_bands = len(wavelengths)
-    
-    # Stack endmembers as columns
-    library_array = np.column_stack([endmembers[name] for name in endmembers.keys()])
-    
-    # Save with ENVI format
+
+    # Create array: (1 line, n_bands samples, n_endmembers bands)
+    # Each band slice represents one complete endmember spectrum
+    library_array = np.zeros((1, n_bands, n_endmembers), dtype=np.float32)
+
+    for i, (name, spectrum) in enumerate(endmembers.items()):
+        library_array[0, :, i] = spectrum.astype(np.float32)
+
+    # Determine byte order (0 = little-endian, 1 = big-endian)
+    byte_order = 0 if sys.byteorder == 'little' else 1
+
+    # ENVI spectral library metadata
     metadata = {
-        'samples': n_endmembers,
-        'lines': 1,
-        'bands': n_bands,
+        'samples': n_bands,           # Number of spectral bands (wavelength points)
+        'lines': 1,                   # Always 1 for spectral library
+        'bands': n_endmembers,        # Number of spectra in library
         'header offset': 0,
         'file type': 'ENVI Spectral Library',
-        'data type': 4,  # 32-bit float
-        'interleave': 'bsq',
-        'byte order': 0,
-        'wavelength': wavelengths.tolist(),
-        'spectra names': list(endmembers.keys())
+        'data type': 4,               # 32-bit float
+        'interleave': 'bil',          # Band Interleave by Line (standard for libraries)
+        'byte order': byte_order,
+        'wavelength': [float(w) for w in wavelengths],
+        'wavelength units': 'Nanometers',
+        'spectra names': list(endmembers.keys()),
+        'z plot titles': ['Wavelength', 'Reflectance']
     }
-    
-    envi.save_image(output_file + '.hdr', library_array.T, metadata=metadata, 
+
+    # Remove .hdr extension if present to avoid double extension
+    if output_file.endswith('.hdr'):
+        output_file = output_file[:-4]
+
+    # Save using spectral library format
+    # The data file will be created without extension, header as .hdr
+    envi.save_image(output_file + '.hdr', library_array, metadata=metadata,
                     force=True, ext='')
+
+
+def validate_envi_library(library_path):
+    """
+    Validate ENVI spectral library file
+
+    Parameters:
+    -----------
+    library_path : str
+        Path to .hdr file
+
+    Returns:
+    --------
+    bool : True if valid, False otherwise
+    """
+    try:
+        lib = envi.open(library_path)
+
+        # Check required metadata
+        required_fields = ['wavelength', 'spectra names', 'file type']
+        for field in required_fields:
+            if field not in lib.metadata:
+                print("[ERROR] Missing required field: {}".format(field))
+                return False
+
+        # Check file type
+        if lib.metadata['file type'] != 'ENVI Spectral Library':
+            print("[ERROR] Incorrect file type: {}".format(lib.metadata['file type']))
+            return False
+
+        # Check dimensions
+        print("[OK] Library contains {} spectra".format(lib.metadata['bands']))
+        print("[OK] Each spectrum has {} bands".format(lib.metadata['samples']))
+        print("[OK] Wavelength range: {}-{} nm".format(
+            lib.metadata['wavelength'][0], lib.metadata['wavelength'][-1]))
+
+        # Try to load data
+        data = lib.load()
+        print("[OK] Data shape: {}".format(data.shape))
+        print("[OK] Data range: {:.4f} - {:.4f}".format(np.min(data), np.max(data)))
+
+        # Check for NaN or Inf values
+        if np.any(np.isnan(data)) or np.any(np.isinf(data)):
+            print("[WARNING] Data contains NaN or Inf values")
+            return False
+
+        return True
+
+    except Exception as e:
+        print("[ERROR] Validation failed: {}".format(str(e)))
+        return False
+
+
+def save_envi_library_alternative(endmembers, wavelengths, output_file):
+    """
+    Alternative method using direct binary write with explicit ENVI header
+
+    Use this if the standard method fails for SNAP compatibility
+
+    Format: BIL (Band Interleave by Line)
+    - Each "band" in the library represents one spectrum
+    - Layout: spectrum1[all wavelengths], spectrum2[all wavelengths], ...
+    """
+    import struct
+    import sys
+
+    n_endmembers = len(endmembers)
+    n_bands = len(wavelengths)
+
+    # Remove .hdr if present
+    if output_file.endswith('.hdr'):
+        output_file = output_file[:-4]
+
+    # Clean spectra: replace NaN/Inf with 0
+    print("  Cleaning spectra (replacing NaN/Inf with 0)...")
+    cleaned_endmembers = {}
+    for name, spectrum in endmembers.items():
+        cleaned_spectrum = np.copy(spectrum)
+        # Replace invalid values
+        cleaned_spectrum = np.nan_to_num(cleaned_spectrum, nan=0.0, posinf=0.0, neginf=0.0)
+        # Clip to reasonable range [0, 1.5]
+        cleaned_spectrum = np.clip(cleaned_spectrum, 0.0, 1.5)
+        cleaned_endmembers[name] = cleaned_spectrum
+
+        n_bad = np.sum(np.isnan(spectrum)) + np.sum(np.isinf(spectrum))
+        if n_bad > 0:
+            print("    {}: cleaned {} bad values".format(name, n_bad))
+
+    # Write binary data file (BIL format for spectral library)
+    # Each band contains one complete spectrum
+    print("  Writing binary data file...")
+    with open(output_file, 'wb') as f:
+        # Write all spectra sequentially
+        for name in cleaned_endmembers.keys():
+            spectrum = cleaned_endmembers[name]
+            for value in spectrum:
+                f.write(struct.pack('f', float(value)))
+
+    # Write header file manually
+    spectra_names_list = list(cleaned_endmembers.keys())
+    spectra_names_str = ', '.join(spectra_names_list)
+    wavelength_str = ', '.join(str(float(w)) for w in wavelengths)
+
+    header_content = """ENVI
+description = {{AMD Mineral Spectral Library}}
+samples = {samples}
+lines = 1
+bands = {bands}
+header offset = 0
+file type = ENVI Spectral Library
+data type = 4
+interleave = bil
+byte order = {byte_order}
+wavelength units = Nanometers
+wavelength = {{{wavelengths}}}
+spectra names = {{{names}}}
+z plot titles = {{Wavelength, Reflectance}}
+""".format(
+        samples=n_bands,
+        bands=n_endmembers,
+        byte_order=0 if sys.byteorder == 'little' else 1,
+        wavelengths=wavelength_str,
+        names=spectra_names_str
+    )
+
+    print("  Writing header file...")
+    with open(output_file + '.hdr', 'w') as f:
+        f.write(header_content)
+
+    print("  [OK] Saved library: {}".format(output_file))
+    print("  [OK] Saved header: {}.hdr".format(output_file))
 
 
 # ============================================================================
@@ -1564,12 +1731,27 @@ def main_workflow():
             envi.save_image(output_path, class_map, metadata=metadata, force=True)
             print("  Saved: {}".format(output_path))
 
+            # Fix for SNAP: rename .img to no extension
+            img_file = os.path.join(OUTPUT_DIR, 'sam_multiclass.img')
+            noext_file = os.path.join(OUTPUT_DIR, 'sam_multiclass')
+            if os.path.exists(img_file) and not os.path.exists(noext_file):
+                import shutil
+                shutil.copy2(img_file, noext_file)
+                print("  [SNAP FIX] Created file without extension for compatibility")
+
             # Export individual angle maps
             print("Exporting individual angle maps...")
             for mineral_name, angle_map in angle_maps.items():
                 output_path = os.path.join(OUTPUT_DIR, 'sam_angle_{}.hdr'.format(mineral_name))
                 envi.save_image(output_path, angle_map, metadata=metadata, force=True)
                 print("  Saved: {}".format(output_path))
+
+                # Fix for SNAP: rename .img to no extension
+                img_file = os.path.join(OUTPUT_DIR, 'sam_angle_{}.img'.format(mineral_name))
+                noext_file = os.path.join(OUTPUT_DIR, 'sam_angle_{}'.format(mineral_name))
+                if os.path.exists(img_file) and not os.path.exists(noext_file):
+                    import shutil
+                    shutil.copy2(img_file, noext_file)
 
         # Export MTMF results
         if abundance_maps:
@@ -1579,6 +1761,13 @@ def main_workflow():
                 envi.save_image(output_path, maps['mf_score'], metadata=metadata, force=True)
                 print("  Saved: {}".format(output_path))
 
+                # Fix for SNAP: rename .img to no extension
+                img_file = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}.img'.format(mineral_name))
+                noext_file = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}'.format(mineral_name))
+                if os.path.exists(img_file) and not os.path.exists(noext_file):
+                    import shutil
+                    shutil.copy2(img_file, noext_file)
+
         # Export refined maps
         if refined_maps:
             print("Exporting refined classification maps...")
@@ -1586,6 +1775,13 @@ def main_workflow():
                 output_path = os.path.join(OUTPUT_DIR, 'refined_{}.hdr'.format(mineral_name))
                 envi.save_image(output_path, refined_map, metadata=metadata, force=True)
                 print("  Saved: {}".format(output_path))
+
+                # Fix for SNAP: rename .img to no extension
+                img_file = os.path.join(OUTPUT_DIR, 'refined_{}.img'.format(mineral_name))
+                noext_file = os.path.join(OUTPUT_DIR, 'refined_{}'.format(mineral_name))
+                if os.path.exists(img_file) and not os.path.exists(noext_file):
+                    import shutil
+                    shutil.copy2(img_file, noext_file)
 
         # Generate and save statistics
         if class_map is not None:
