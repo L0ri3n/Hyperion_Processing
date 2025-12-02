@@ -1250,15 +1250,18 @@ def main_workflow():
     # FILE PATHS - Update these paths for your data
     # ========================================================================
 
+    # Dataset identifier (update this for each dataset)
+    DATASET_ID = 'EO1H2020342013284110KF'  # Update this for your dataset
+
     # Input files
-    HYPERION_CUBE_PATH = './amd_mapping/data/hyperion/EO1H2020342016359110KF_reflectance.hdr'
+    HYPERION_CUBE_PATH = './amd_mapping/data/hyperion/{}_reflectance.hdr'.format(DATASET_ID)
     ENDMEMBER_LIBRARY_PATH = './amd_mapping/data/outputs/endmember_library_matched.csv'
 
-    # Output directory
-    OUTPUT_DIR = './amd_mapping/outputs/classifications'
+    # Output directory (includes dataset ID)
+    OUTPUT_DIR = './amd_mapping/outputs/classifications_{}'.format(DATASET_ID)
 
     # SAM parameters
-    SAM_THRESHOLD = 1.40  # radians (smaller = more strict)
+    SAM_THRESHOLD = 0.25  # radians (smaller = more strict)
 
     # Subset for testing (set to None to process full image)
     # Format: ((row_start, row_end), (col_start, col_end))
@@ -1466,7 +1469,7 @@ def main_workflow():
 
     ax.set_xlabel('Wavelength (nm)', fontsize=12, fontweight='bold')
     ax.set_ylabel('Reflectance', fontsize=12, fontweight='bold')
-    ax.set_title('AMD Mineral Endmember Spectra (Hyperion Wavelengths)',
+    ax.set_title('AMD Mineral Endmember Spectra - {}'.format(DATASET_ID),
                  fontsize=14, fontweight='bold')
     ax.legend(fontsize=10, loc='best')
     ax.grid(True, alpha=0.3)
@@ -1476,7 +1479,7 @@ def main_workflow():
     ax.axvspan(850, 950, alpha=0.15, color='red', label='Fe oxides (850-950nm)')
 
     plt.tight_layout()
-    plot_path = os.path.join(plot_dir, 'mineral_spectra.png')
+    plot_path = os.path.join(plot_dir, 'mineral_spectra_{}.png'.format(DATASET_ID))
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
     print("  Saved: {}".format(plot_path))
@@ -1504,7 +1507,7 @@ def main_workflow():
         axes[idx].axis('off')
 
     plt.tight_layout()
-    plot_path = os.path.join(plot_dir, 'mineral_spectra_individual.png')
+    plot_path = os.path.join(plot_dir, 'mineral_spectra_individual_{}.png'.format(DATASET_ID))
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
     print("  Saved: {}".format(plot_path))
@@ -1538,11 +1541,11 @@ def main_workflow():
 
         fig, ax = plt.subplots(figsize=(12, 10))
         ax.imshow(rgb)
-        ax.set_title('Hyperion RGB Composite (Approximate True Color)',
+        ax.set_title('Hyperion RGB Composite - {}'.format(DATASET_ID),
                      fontsize=14, fontweight='bold')
         ax.axis('off')
         plt.tight_layout()
-        plot_path = os.path.join(plot_dir, 'hyperion_rgb.png')
+        plot_path = os.path.join(plot_dir, 'hyperion_rgb_{}.png'.format(DATASET_ID))
         plt.savefig(plot_path, dpi=200, bbox_inches='tight')
         plt.close()
         print("  Saved: {}".format(plot_path))
@@ -1569,11 +1572,11 @@ def main_workflow():
 
         ax.set_xlabel('Wavelength (nm)', fontsize=12, fontweight='bold')
         ax.set_ylabel('Reflectance', fontsize=12, fontweight='bold')
-        ax.set_title('Sample Hyperion Pixel Spectra', fontsize=14, fontweight='bold')
+        ax.set_title('Sample Hyperion Pixel Spectra - {}'.format(DATASET_ID), fontsize=14, fontweight='bold')
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        plot_path = os.path.join(plot_dir, 'sample_pixel_spectra.png')
+        plot_path = os.path.join(plot_dir, 'sample_pixel_spectra_{}.png'.format(DATASET_ID))
         plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
         print("  Saved: {}".format(plot_path))
@@ -1596,12 +1599,12 @@ def main_workflow():
 
     ax.set_xlabel('Wavelength (nm)', fontsize=12, fontweight='bold')
     ax.set_ylabel('Reflectance', fontsize=12, fontweight='bold')
-    ax.set_title('Mean Hyperion Spectrum vs Mineral Endmembers',
+    ax.set_title('Mean Hyperion Spectrum vs Mineral Endmembers - {}'.format(DATASET_ID),
                  fontsize=14, fontweight='bold')
     ax.legend(fontsize=9, loc='best')
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plot_path = os.path.join(plot_dir, 'mean_spectrum_comparison.png')
+    plot_path = os.path.join(plot_dir, 'mean_spectrum_comparison_{}.png'.format(DATASET_ID))
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
     print("  Saved: {}".format(plot_path))
@@ -1727,13 +1730,13 @@ def main_workflow():
         # Export SAM results
         if class_map is not None:
             print("Exporting SAM classification map...")
-            output_path = os.path.join(OUTPUT_DIR, 'sam_multiclass.hdr')
+            output_path = os.path.join(OUTPUT_DIR, 'sam_multiclass_{}.hdr'.format(DATASET_ID))
             envi.save_image(output_path, class_map, metadata=metadata, force=True)
             print("  Saved: {}".format(output_path))
 
             # Fix for SNAP: rename .img to no extension
-            img_file = os.path.join(OUTPUT_DIR, 'sam_multiclass.img')
-            noext_file = os.path.join(OUTPUT_DIR, 'sam_multiclass')
+            img_file = os.path.join(OUTPUT_DIR, 'sam_multiclass_{}.img'.format(DATASET_ID))
+            noext_file = os.path.join(OUTPUT_DIR, 'sam_multiclass_{}'.format(DATASET_ID))
             if os.path.exists(img_file) and not os.path.exists(noext_file):
                 import shutil
                 shutil.copy2(img_file, noext_file)
@@ -1742,13 +1745,13 @@ def main_workflow():
             # Export individual angle maps
             print("Exporting individual angle maps...")
             for mineral_name, angle_map in angle_maps.items():
-                output_path = os.path.join(OUTPUT_DIR, 'sam_angle_{}.hdr'.format(mineral_name))
+                output_path = os.path.join(OUTPUT_DIR, 'sam_angle_{}_{}.hdr'.format(mineral_name, DATASET_ID))
                 envi.save_image(output_path, angle_map, metadata=metadata, force=True)
                 print("  Saved: {}".format(output_path))
 
                 # Fix for SNAP: rename .img to no extension
-                img_file = os.path.join(OUTPUT_DIR, 'sam_angle_{}.img'.format(mineral_name))
-                noext_file = os.path.join(OUTPUT_DIR, 'sam_angle_{}'.format(mineral_name))
+                img_file = os.path.join(OUTPUT_DIR, 'sam_angle_{}_{}.img'.format(mineral_name, DATASET_ID))
+                noext_file = os.path.join(OUTPUT_DIR, 'sam_angle_{}_{}'.format(mineral_name, DATASET_ID))
                 if os.path.exists(img_file) and not os.path.exists(noext_file):
                     import shutil
                     shutil.copy2(img_file, noext_file)
@@ -1757,13 +1760,13 @@ def main_workflow():
         if abundance_maps:
             print("Exporting MTMF abundance maps...")
             for mineral_name, maps in abundance_maps.items():
-                output_path = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}.hdr'.format(mineral_name))
+                output_path = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}_{}.hdr'.format(mineral_name, DATASET_ID))
                 envi.save_image(output_path, maps['mf_score'], metadata=metadata, force=True)
                 print("  Saved: {}".format(output_path))
 
                 # Fix for SNAP: rename .img to no extension
-                img_file = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}.img'.format(mineral_name))
-                noext_file = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}'.format(mineral_name))
+                img_file = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}_{}.img'.format(mineral_name, DATASET_ID))
+                noext_file = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}_{}'.format(mineral_name, DATASET_ID))
                 if os.path.exists(img_file) and not os.path.exists(noext_file):
                     import shutil
                     shutil.copy2(img_file, noext_file)
@@ -1772,13 +1775,13 @@ def main_workflow():
         if refined_maps:
             print("Exporting refined classification maps...")
             for mineral_name, refined_map in refined_maps.items():
-                output_path = os.path.join(OUTPUT_DIR, 'refined_{}.hdr'.format(mineral_name))
+                output_path = os.path.join(OUTPUT_DIR, 'refined_{}_{}.hdr'.format(mineral_name, DATASET_ID))
                 envi.save_image(output_path, refined_map, metadata=metadata, force=True)
                 print("  Saved: {}".format(output_path))
 
                 # Fix for SNAP: rename .img to no extension
-                img_file = os.path.join(OUTPUT_DIR, 'refined_{}.img'.format(mineral_name))
-                noext_file = os.path.join(OUTPUT_DIR, 'refined_{}'.format(mineral_name))
+                img_file = os.path.join(OUTPUT_DIR, 'refined_{}_{}.img'.format(mineral_name, DATASET_ID))
+                noext_file = os.path.join(OUTPUT_DIR, 'refined_{}_{}'.format(mineral_name, DATASET_ID))
                 if os.path.exists(img_file) and not os.path.exists(noext_file):
                     import shutil
                     shutil.copy2(img_file, noext_file)
@@ -1809,7 +1812,7 @@ def main_workflow():
                 })
 
             stats_df = pd.DataFrame(stats_data)
-            stats_path = os.path.join(OUTPUT_DIR, 'classification_statistics.csv')
+            stats_path = os.path.join(OUTPUT_DIR, 'classification_statistics_{}.csv'.format(DATASET_ID))
             stats_df.to_csv(stats_path, index=False)
             print("  Saved statistics: {}".format(stats_path))
             print("\n{}".format(stats_df.to_string(index=False)))
