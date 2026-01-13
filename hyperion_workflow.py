@@ -31,14 +31,39 @@ import numpy as np
 import pandas as pd
 from spectral import *
 import matplotlib.pyplot as plt
+import sys
+import os
+
+# Add the code directory to path to import our USGS loader
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'amd_mapping', 'code'))
+
+# Import USGS spectral library functions
+try:
+    from load_usgs_spectrum import load_minerals_spectra
+    USGS_LOADER_AVAILABLE = True
+except ImportError:
+    USGS_LOADER_AVAILABLE = False
+    print("[WARNING] USGS loader not available. Using fallback methods.")
 
 def download_usgs_library():
     """
-    Manual download from USGS website or use their API
-    Files typically named: mineral_name.txt
-    Format: wavelength(nm), reflectance
+    Load USGS spectral library using the custom loader
+
+    The loader automatically:
+    - Loads Hyperion wavelengths from the USGS library
+    - Searches for mineral files by name (case-insensitive)
+    - Returns dict of {mineral_name: (wavelength, reflectance)}
+
+    To customize minerals, edit MINERALS_TO_LOAD in load_usgs_spectrum.py
     """
-    pass
+    if not USGS_LOADER_AVAILABLE:
+        print("[ERROR] USGS loader module not found")
+        return {}
+
+    # Load minerals using the custom loader
+    spectra = load_minerals_spectra()
+
+    return spectra
 
 # Step 2.2: Collect AMD-Specific Spectra from Publications
 # ----------------------------------------------------------
@@ -121,74 +146,278 @@ def resample_spectrum_to_hyperion(lib_wavelengths, lib_reflectance,
     resampled = np.interp(hyperion_wavelengths, lib_wavelengths, lib_reflectance)
     return resampled
 
-def create_endmember_library(library_dir, hyperion_wavelengths, output_file):
+def create_endmember_library(library_dir=None, hyperion_wavelengths=None, output_file=None):
     """
     Process all library spectra and save as Hyperion-compatible library
-    
+
     Parameters:
     -----------
-    library_dir : str
-        Directory containing library spectra files
-    hyperion_wavelengths : array
-        Hyperion wavelengths for resampling
+    library_dir : str, optional
+        Directory containing library spectra files (ignored if using USGS loader)
+    hyperion_wavelengths : array, optional
+        Hyperion wavelengths for resampling (USGS loader provides its own)
     output_file : str
         Output file for endmember library (.sli or .csv)
+
+    Returns:
+    --------
+    endmembers : dict
+        Dictionary with {mineral_name: reflectance_array}
+    wavelengths : array
+        Corresponding wavelengths
     """
-    import os
-    import glob
-    
-    endmembers = {}
-    
-    # Process each spectrum file
-    for filepath in glob.glob(os.path.join(library_dir, '*.txt')):
-        mineral_name = os.path.basename(filepath).replace('.txt', '')
-        
-        # Load spectrum (adjust format as needed)
-        data = np.loadtxt(filepath, skiprows=1)
-        lib_wvl = data[:, 0]
-        lib_ref = data[:, 1]
-        
-        # Resample to Hyperion
-        resampled = resample_spectrum_to_hyperion(lib_wvl, lib_ref, 
-                                                   hyperion_wavelengths)
-        endmembers[mineral_name] = resampled
-    
-    # Save as spectral library
-    # Format 1: CSV for easy viewing
-    df = pd.DataFrame(endmembers, index=hyperion_wavelengths)
-    df.to_csv(output_file.replace('.sli', '.csv'))
-    
-    # Format 2: ENVI spectral library format
-    save_envi_library(endmembers, hyperion_wavelengths, output_file)
-    
-    return endmembers
+
+    # Method 1: Use USGS loader (preferred)
+    if USGS_LOADER_AVAILABLE and library_dir is None:
+        print("Loading USGS spectral library with built-in loader...")
+        spectra_dict = load_minerals_spectra()
+
+        if not spectra_dict:
+            print("[ERROR] No spectra loaded")
+            return {}, np.array([])
+
+        # Extract wavelengths (same for all minerals)
+        wavelengths = list(spectra_dict.values())[0][0]
+
+        # Create endmember dict with just reflectance values
+        endmembers = {}
+        for mineral_name, (wvl, ref) in spectra_dict.items():
+            endmembers[mineral_name] = ref
+
+        print("Loaded {} minerals with {} bands".format(len(endmembers), len(wavelengths)))
+
+    # Method 2: Fallback to manual loading
+    else:
+        print("Using manual spectral library loading...")
+        import glob
+
+        if library_dir is None or hyperion_wavelengths is None:
+            print("[ERROR] library_dir and hyperion_wavelengths required for manual loading")
+            return {}, np.array([])
+
+        endmembers = {}
+        wavelengths = hyperion_wavelengths
+
+        # Process each spectrum file
+        for filepath in glob.glob(os.path.join(library_dir, '*.txt')):
+            mineral_name = os.path.basename(filepath).replace('.txt', '')
+
+            # Load spectrum (adjust format as needed)
+            data = np.loadtxt(filepath, skiprows=1)
+            lib_wvl = data[:, 0]
+            lib_ref = data[:, 1]
+
+            # Resample to Hyperion
+            resampled = resample_spectrum_to_hyperion(lib_wvl, lib_ref,
+                                                       hyperion_wavelengths)
+            endmembers[mineral_name] = resampled
+
+    # Save library if output file specified
+    if output_file is not None:
+        # Format 1: CSV for easy viewing
+        df = pd.DataFrame(endmembers, index=wavelengths)
+        df.to_csv(output_file.replace('.sli', '.csv'))
+        print("Saved CSV library to: {}".format(output_file.replace('.sli', '.csv')))
+
+        # Format 2: ENVI spectral library format
+        save_envi_library(endmembers, wavelengths, output_file)
+        print("Saved ENVI library to: {}".format(output_file))
+
+        # Validate the saved library
+        print("\nValidating ENVI library format...")
+        output_hdr = output_file if output_file.endswith('.hdr') else output_file + '.hdr'
+        if validate_envi_library(output_hdr):
+            print("[SUCCESS] Library is valid and SNAP-compatible")
+        else:
+            print("[WARNING] Library may have compatibility issues")
+            print("  Trying alternative save method...")
+            save_envi_library_alternative(endmembers, wavelengths, output_file)
+            if validate_envi_library(output_hdr):
+                print("[SUCCESS] Alternative method succeeded")
+            else:
+                print("[ERROR] Both methods failed - manual inspection required")
+
+    return endmembers, wavelengths
 
 def save_envi_library(endmembers, wavelengths, output_file):
     """
-    Save endmembers in ENVI spectral library format
+    Save endmembers in ENVI spectral library format (SNAP-compatible)
+
+    ENVI Spectral Library Format:
+    - Data: (lines=1, samples=n_bands, bands=n_endmembers)
+    - Each band represents one endmember spectrum
+    - BIL (band interleave by line) is standard for spectral libraries
     """
+    import sys
+
     n_endmembers = len(endmembers)
     n_bands = len(wavelengths)
-    
-    # Stack endmembers as columns
-    library_array = np.column_stack([endmembers[name] for name in endmembers.keys()])
-    
-    # Save with ENVI format
+
+    # Create array: (1 line, n_bands samples, n_endmembers bands)
+    # Each band slice represents one complete endmember spectrum
+    library_array = np.zeros((1, n_bands, n_endmembers), dtype=np.float32)
+
+    for i, (name, spectrum) in enumerate(endmembers.items()):
+        library_array[0, :, i] = spectrum.astype(np.float32)
+
+    # Determine byte order (0 = little-endian, 1 = big-endian)
+    byte_order = 0 if sys.byteorder == 'little' else 1
+
+    # ENVI spectral library metadata
     metadata = {
-        'samples': n_endmembers,
-        'lines': 1,
-        'bands': n_bands,
+        'samples': n_bands,           # Number of spectral bands (wavelength points)
+        'lines': 1,                   # Always 1 for spectral library
+        'bands': n_endmembers,        # Number of spectra in library
         'header offset': 0,
         'file type': 'ENVI Spectral Library',
-        'data type': 4,  # 32-bit float
-        'interleave': 'bsq',
-        'byte order': 0,
-        'wavelength': wavelengths.tolist(),
-        'spectra names': list(endmembers.keys())
+        'data type': 4,               # 32-bit float
+        'interleave': 'bil',          # Band Interleave by Line (standard for libraries)
+        'byte order': byte_order,
+        'wavelength': [float(w) for w in wavelengths],
+        'wavelength units': 'Nanometers',
+        'spectra names': list(endmembers.keys()),
+        'z plot titles': ['Wavelength', 'Reflectance']
     }
-    
-    envi.save_image(output_file + '.hdr', library_array.T, metadata=metadata, 
+
+    # Remove .hdr extension if present to avoid double extension
+    if output_file.endswith('.hdr'):
+        output_file = output_file[:-4]
+
+    # Save using spectral library format
+    # The data file will be created without extension, header as .hdr
+    envi.save_image(output_file + '.hdr', library_array, metadata=metadata,
                     force=True, ext='')
+
+
+def validate_envi_library(library_path):
+    """
+    Validate ENVI spectral library file
+
+    Parameters:
+    -----------
+    library_path : str
+        Path to .hdr file
+
+    Returns:
+    --------
+    bool : True if valid, False otherwise
+    """
+    try:
+        lib = envi.open(library_path)
+
+        # Check required metadata
+        required_fields = ['wavelength', 'spectra names', 'file type']
+        for field in required_fields:
+            if field not in lib.metadata:
+                print("[ERROR] Missing required field: {}".format(field))
+                return False
+
+        # Check file type
+        if lib.metadata['file type'] != 'ENVI Spectral Library':
+            print("[ERROR] Incorrect file type: {}".format(lib.metadata['file type']))
+            return False
+
+        # Check dimensions
+        print("[OK] Library contains {} spectra".format(lib.metadata['bands']))
+        print("[OK] Each spectrum has {} bands".format(lib.metadata['samples']))
+        print("[OK] Wavelength range: {}-{} nm".format(
+            lib.metadata['wavelength'][0], lib.metadata['wavelength'][-1]))
+
+        # Try to load data
+        data = lib.load()
+        print("[OK] Data shape: {}".format(data.shape))
+        print("[OK] Data range: {:.4f} - {:.4f}".format(np.min(data), np.max(data)))
+
+        # Check for NaN or Inf values
+        if np.any(np.isnan(data)) or np.any(np.isinf(data)):
+            print("[WARNING] Data contains NaN or Inf values")
+            return False
+
+        return True
+
+    except Exception as e:
+        print("[ERROR] Validation failed: {}".format(str(e)))
+        return False
+
+
+def save_envi_library_alternative(endmembers, wavelengths, output_file):
+    """
+    Alternative method using direct binary write with explicit ENVI header
+
+    Use this if the standard method fails for SNAP compatibility
+
+    Format: BIL (Band Interleave by Line)
+    - Each "band" in the library represents one spectrum
+    - Layout: spectrum1[all wavelengths], spectrum2[all wavelengths], ...
+    """
+    import struct
+    import sys
+
+    n_endmembers = len(endmembers)
+    n_bands = len(wavelengths)
+
+    # Remove .hdr if present
+    if output_file.endswith('.hdr'):
+        output_file = output_file[:-4]
+
+    # Clean spectra: replace NaN/Inf with 0
+    print("  Cleaning spectra (replacing NaN/Inf with 0)...")
+    cleaned_endmembers = {}
+    for name, spectrum in endmembers.items():
+        cleaned_spectrum = np.copy(spectrum)
+        # Replace invalid values
+        cleaned_spectrum = np.nan_to_num(cleaned_spectrum, nan=0.0, posinf=0.0, neginf=0.0)
+        # Clip to reasonable range [0, 1.5]
+        cleaned_spectrum = np.clip(cleaned_spectrum, 0.0, 1.5)
+        cleaned_endmembers[name] = cleaned_spectrum
+
+        n_bad = np.sum(np.isnan(spectrum)) + np.sum(np.isinf(spectrum))
+        if n_bad > 0:
+            print("    {}: cleaned {} bad values".format(name, n_bad))
+
+    # Write binary data file (BIL format for spectral library)
+    # Each band contains one complete spectrum
+    print("  Writing binary data file...")
+    with open(output_file, 'wb') as f:
+        # Write all spectra sequentially
+        for name in cleaned_endmembers.keys():
+            spectrum = cleaned_endmembers[name]
+            for value in spectrum:
+                f.write(struct.pack('f', float(value)))
+
+    # Write header file manually
+    spectra_names_list = list(cleaned_endmembers.keys())
+    spectra_names_str = ', '.join(spectra_names_list)
+    wavelength_str = ', '.join(str(float(w)) for w in wavelengths)
+
+    header_content = """ENVI
+description = {{AMD Mineral Spectral Library}}
+samples = {samples}
+lines = 1
+bands = {bands}
+header offset = 0
+file type = ENVI Spectral Library
+data type = 4
+interleave = bil
+byte order = {byte_order}
+wavelength units = Nanometers
+wavelength = {{{wavelengths}}}
+spectra names = {{{names}}}
+z plot titles = {{Wavelength, Reflectance}}
+""".format(
+        samples=n_bands,
+        bands=n_endmembers,
+        byte_order=0 if sys.byteorder == 'little' else 1,
+        wavelengths=wavelength_str,
+        names=spectra_names_str
+    )
+
+    print("  Writing header file...")
+    with open(output_file + '.hdr', 'w') as f:
+        f.write(header_content)
+
+    print("  [OK] Saved library: {}".format(output_file))
+    print("  [OK] Saved header: {}.hdr".format(output_file))
 
 
 # ============================================================================
@@ -278,18 +507,156 @@ def apply_continuum_removal_cube(cube):
 
 """
 GOAL: Classify pixels based on spectral similarity to endmembers
-TOOLS: Python (pysptools), QGIS (OTB), or SNAP
+TOOLS: Python (spectral, numpy)
 OUTPUT: SAM classification maps for each mineral
 """
 
 # Method 1: Python implementation (recommended for automation)
 # -------------------------------------------------------------
-from pysptools.classification import SAM
+
+def spectral_angle(pixel, endmember):
+    """
+    Compute spectral angle in radians
+
+    Parameters:
+    -----------
+    pixel : array
+        Pixel spectrum
+    endmember : array
+        Endmember spectrum
+
+    Returns:
+    --------
+    angle : float
+        Spectral angle in radians
+    """
+    dot_product = np.dot(pixel, endmember)
+    norm_product = np.linalg.norm(pixel) * np.linalg.norm(endmember)
+
+    # Avoid division by zero and numerical errors
+    if norm_product == 0:
+        return np.pi  # Maximum angle
+
+    cos_angle = np.clip(dot_product / norm_product, -1, 1)
+    return np.arccos(cos_angle)
+
+def run_sam_single_mineral(cube, endmember_spectrum, threshold=0.10):
+    """
+    Run SAM for single mineral
+
+    Parameters:
+    -----------
+    cube : array (rows, cols, bands)
+        Preprocessed Hyperion cube
+    endmember_spectrum : array (bands,)
+        Target mineral spectrum
+    threshold : float (default=0.10)
+        Maximum angle in radians for classification
+
+    Returns:
+    --------
+    class_map : array (rows, cols)
+        1 = classified as mineral, 0 = not classified
+    angle_map : array (rows, cols)
+        Spectral angle in radians
+    """
+    rows, cols, bands = cube.shape
+    angle_map = np.zeros((rows, cols), dtype=np.float32)
+
+    print(f"Processing {rows} x {cols} pixels...")
+    for i in range(rows):
+        if i % 50 == 0:
+            print(f"  Row {i}/{rows}")
+        for j in range(cols):
+            pixel = cube[i, j, :]
+            if np.any(pixel > 0):  # Valid pixel
+                angle_map[i, j] = spectral_angle(pixel, endmember_spectrum)
+            else:
+                angle_map[i, j] = np.pi  # Invalid
+
+    # Classify based on threshold
+    class_map = (angle_map < threshold).astype(np.uint8)
+
+    print(f"Classified pixels: {class_map.sum()} ({class_map.sum()/class_map.size*100:.2f}%)")
+
+    # Only print angle statistics if there are valid pixels
+    valid_angles = angle_map[angle_map < np.pi]
+    if len(valid_angles) > 0:
+        print(f"Mean angle: {valid_angles.mean():.3f} rad")
+        print(f"Min angle: {valid_angles.min():.3f} rad")
+    else:
+        print("Warning: No valid pixels found (all pixels are zero/invalid)")
+
+    return class_map, angle_map
+
+def run_sam_all_minerals(cube, endmember_dict, threshold=0.10):
+    """
+    Run SAM for all minerals and create multi-class map
+
+    Parameters:
+    -----------
+    cube : array (rows, cols, bands)
+        Preprocessed Hyperion cube
+    endmember_dict : dict
+        Dictionary with {mineral_name: endmember_spectrum}
+    threshold : float (default=0.10)
+        Maximum angle in radians for classification
+
+    Returns:
+    --------
+    class_map : array (rows, cols)
+        0 = unclassified, 1-N = mineral classes
+    angle_maps : dict
+        Dictionary of angle maps for each mineral
+    """
+    rows, cols, bands = cube.shape
+    n_minerals = len(endmember_dict)
+
+    # Compute angle maps for all minerals
+    angle_maps = {}
+    print("Computing spectral angles...")
+
+    for mineral_name, endmember in endmember_dict.items():
+        print(f"  Processing {mineral_name}...")
+        angle_map = np.zeros((rows, cols), dtype=np.float32)
+
+        for i in range(rows):
+            if i % 50 == 0:
+                print(f"    Row {i}/{rows}")
+            for j in range(cols):
+                pixel = cube[i, j, :]
+                if np.any(pixel > 0):
+                    angle_map[i, j] = spectral_angle(pixel, endmember)
+                else:
+                    angle_map[i, j] = np.pi
+
+        angle_maps[mineral_name] = angle_map
+
+    # Create classification map (assign to closest mineral if < threshold)
+    print("Creating classification map...")
+    class_map = np.zeros((rows, cols), dtype=np.uint8)
+    min_angles = np.full((rows, cols), np.pi)
+
+    for idx, (mineral_name, angle_map) in enumerate(angle_maps.items(), 1):
+        # Update classification where this mineral has minimum angle
+        mask = (angle_map < min_angles) & (angle_map < threshold)
+        class_map[mask] = idx
+        min_angles[mask] = angle_map[mask]
+
+    # Print statistics
+    print("\nClassification results:")
+    print(f"Unclassified: {np.sum(class_map == 0)} pixels")
+    for idx, mineral_name in enumerate(endmember_dict.keys(), 1):
+        count = np.sum(class_map == idx)
+        pct = count / class_map.size * 100
+        print(f"{mineral_name}: {count} pixels ({pct:.2f}%)")
+
+    return class_map, angle_maps
 
 def run_sam_classification(cube, endmembers, threshold=0.10):
     """
-    Run Spectral Angle Mapper classification
-    
+    Run Spectral Angle Mapper classification (wrapper function for compatibility)
+
     Parameters:
     -----------
     cube : array (rows, cols, bands)
@@ -298,54 +665,22 @@ def run_sam_classification(cube, endmembers, threshold=0.10):
         Endmember spectra (minerals)
     threshold : float (default=0.10)
         Maximum angle in radians for classification
-    
+
     Returns:
     --------
     class_map : array (rows, cols)
         Classification map (0=unclassified, 1-N=mineral classes)
-    angle_map : array (rows, cols, n_endmembers)
-        Spectral angle for each endmember
+    angle_maps : dict or array
+        Spectral angle maps for each endmember
     """
-    # Convert endmembers dict to array if needed
+    # Use improved implementation based on input type
     if isinstance(endmembers, dict):
-        E = np.array([endmembers[name] for name in endmembers.keys()])
+        return run_sam_all_minerals(cube, endmembers, threshold)
     else:
-        E = endmembers
-    
-    # Run SAM
-    sam = SAM()
-    class_map = sam.classify(cube, E, threshold)
-    
-    # Get angle maps
-    angle_map = compute_sam_angles(cube, E)
-    
-    return class_map, angle_map
-
-def compute_sam_angles(cube, endmembers):
-    """
-    Compute spectral angle between each pixel and each endmember
-    
-    Returns:
-    --------
-    angles : array (rows, cols, n_endmembers)
-        Angle in radians for each endmember
-    """
-    rows, cols, bands = cube.shape
-    n_endmembers = endmembers.shape[0]
-    angles = np.zeros((rows, cols, n_endmembers))
-    
-    for i in range(rows):
-        for j in range(cols):
-            pixel = cube[i, j, :]
-            for k in range(n_endmembers):
-                endmember = endmembers[k, :]
-                # Spectral angle formula
-                angles[i, j, k] = np.arccos(
-                    np.dot(pixel, endmember) / 
-                    (np.linalg.norm(pixel) * np.linalg.norm(endmember))
-                )
-    
-    return angles
+        # Convert array to dict if needed
+        endmember_dict = {f"mineral_{i+1}": endmembers[i]
+                          for i in range(endmembers.shape[0])}
+        return run_sam_all_minerals(cube, endmember_dict, threshold)
 
 # Method 2: QGIS with OTB (Orfeo ToolBox)
 # ----------------------------------------
@@ -834,6 +1169,60 @@ def export_final_products(results_dict, output_dir):
 
 
 # ============================================================================
+# DATA VALIDATION FUNCTION
+# ============================================================================
+
+def validate_sam_inputs(cube, endmembers):
+    """
+    Validate inputs before running SAM
+    Returns: (is_valid, error_message)
+    """
+
+    # Check 1: Band counts
+    cube_bands = cube.shape[2]
+    endmember_bands = len(list(endmembers.values())[0])
+
+    if cube_bands != endmember_bands:
+        return False, "Band mismatch: cube={}, endmembers={}".format(cube_bands, endmember_bands)
+
+    # Check 2: Valid pixels exist
+    valid_pixels = np.sum(np.any(cube > 0, axis=2))
+    total_pixels = cube.shape[0] * cube.shape[1]
+    valid_pct = (valid_pixels / total_pixels) * 100
+
+    if valid_pixels == 0:
+        return False, "No valid pixels in cube (all zeros)"
+
+    if valid_pct < 1:
+        print("WARNING: Only {:.2f}% of pixels are valid".format(valid_pct))
+
+    # Check 3: Scales look reasonable
+    cube_valid = cube[cube > 0]
+    cube_max = np.max(cube_valid)
+    em_max = max(np.max(spec) for spec in endmembers.values())
+
+    if cube_max > 2.0 or em_max > 2.0:
+        return False, "Scale issue detected: cube_max={:.2f}, em_max={:.2f}".format(cube_max, em_max)
+
+    # Check 4: Test spectral angle calculation
+    test_pixel = cube[cube.shape[0]//2, cube.shape[1]//2, :]
+    if np.any(test_pixel > 0):
+        test_em = list(endmembers.values())[0]
+
+        dot = np.dot(test_pixel, test_em)
+        norm_p = np.linalg.norm(test_pixel)
+        norm_e = np.linalg.norm(test_em)
+
+        if norm_p > 0 and norm_e > 0:
+            cos_angle = dot / (norm_p * norm_e)
+
+            if abs(cos_angle) > 1.0:
+                return False, "Invalid cosine: {:.6f} (scale mismatch!)".format(cos_angle)
+
+    return True, "All validation checks passed"
+
+
+# ============================================================================
 # MAIN WORKFLOW EXECUTION
 # ============================================================================
 
@@ -841,69 +1230,600 @@ def main_workflow():
     """
     Complete workflow from Step 2 onwards
     (Assuming Step 1 done with SUREHYP)
+
+    Configure which steps to run by setting True/False below
     """
-    
-    print("=== STEP 2: Building Spectral Library ===")
-    # Load Hyperion wavelengths
-    hyperion_wvl = load_hyperion_wavelengths('hyperion_cube.hdr')
-    
-    # Create endmember library
-    endmembers = create_endmember_library(
-        library_dir='./spectral_library/',
-        hyperion_wavelengths=hyperion_wvl,
-        output_file='./outputs/endmember_library.sli'
-    )
-    
-    print("=== STEP 3: Enhancing Spectral Features ===")
-    # Load preprocessed cube from Step 1
-    cube = envi.open('hyperion_cube.hdr').load()
-    
-    # Apply Savitzky-Golay smoothing
-    cube_smooth = apply_savgol_smoothing(cube)
-    
-    # Optional: Continuum removal
-    # cube_cr = apply_continuum_removal_cube(cube_smooth)
-    
-    print("=== STEP 4: Running SAM Classification ===")
-    class_map, angle_map = run_sam_classification(
-        cube_smooth, 
-        endmembers, 
-        threshold=0.10
-    )
-    
-    print("=== STEP 5: Running MTMF for Abundances ===")
-    abundance_maps = {}
-    for mineral_name, spectrum in endmembers.items():
-        mf_score, infeas = run_mtmf(cube_smooth, spectrum)
-        abundance_maps[mineral_name] = {
-            'mf_score': mf_score,
-            'infeasibility': infeas
-        }
-    
-    print("=== STEP 6: Postprocessing ===")
-    refined_maps = {}
-    for mineral_name in endmembers.keys():
-        combined = combine_sam_mtmf(
-            sam_class=class_map,
-            sam_angle=angle_map[:,:,i],  # Index for this mineral
-            mtmf_score=abundance_maps[mineral_name]['mf_score'],
-            mtmf_infeasibility=abundance_maps[mineral_name]['infeasibility']
+
+    # ========================================================================
+    # CONFIGURATION - Set True/False to enable/disable each step
+    # ========================================================================
+
+    RUN_STEP_2_BUILD_LIBRARY = False      # Build spectral library (if not done)
+    RUN_STEP_3_ENHANCEMENT = False        # Spectral enhancement (smoothing, etc.)
+    RUN_STEP_4_SAM = True                 # SAM classification
+    RUN_STEP_5_MTMF = False               # MTMF abundance mapping
+    RUN_STEP_6_POSTPROCESSING = False     # Combine and clean results
+    RUN_STEP_7_VALIDATION = False         # Validation checks
+    RUN_STEP_8_EXPORT = True              # Export final products
+
+    # ========================================================================
+    # FILE PATHS - Update these paths for your data
+    # ========================================================================
+
+    # Dataset identifier (update this for each dataset)
+    DATASET_ID = 'EO1H2020342013284110KF'  # Update this for your dataset
+
+    # Input files
+    HYPERION_CUBE_PATH = './amd_mapping/data/hyperion/{}_reflectance.hdr'.format(DATASET_ID)
+    ENDMEMBER_LIBRARY_PATH = './amd_mapping/data/outputs/endmember_library_matched.csv'
+
+    # Output directory (includes dataset ID)
+    OUTPUT_DIR = './amd_mapping/outputs/classifications_{}'.format(DATASET_ID)
+
+    # SAM parameters
+    SAM_THRESHOLD = 0.25  # radians (smaller = more strict)
+
+    # Subset for testing (set to None to process full image)
+    # Format: ((row_start, row_end), (col_start, col_end))
+    PROCESS_SUBSET = None  # None = full image
+    # PROCESS_SUBSET = ((1000, 1500), (200, 700))  # Example subset
+
+    # ========================================================================
+    # WORKFLOW EXECUTION
+    # ========================================================================
+
+    print("=" * 70)
+    print("AMD MINERAL MAPPING WORKFLOW")
+    print("=" * 70)
+    print("\nConfiguration:")
+    print("  - Build Library: {}".format(RUN_STEP_2_BUILD_LIBRARY))
+    print("  - Enhancement: {}".format(RUN_STEP_3_ENHANCEMENT))
+    print("  - SAM Classification: {}".format(RUN_STEP_4_SAM))
+    print("  - MTMF: {}".format(RUN_STEP_5_MTMF))
+    print("  - Postprocessing: {}".format(RUN_STEP_6_POSTPROCESSING))
+    print("  - Validation: {}".format(RUN_STEP_7_VALIDATION))
+    print("  - Export: {}".format(RUN_STEP_8_EXPORT))
+    print("=" * 70)
+
+    # ========================================================================
+    # STEP 2: Build Spectral Library (Optional)
+    # ========================================================================
+
+    if RUN_STEP_2_BUILD_LIBRARY:
+        print("\n=== STEP 2: Building Spectral Library ===")
+
+        if USGS_LOADER_AVAILABLE:
+            endmembers, hyperion_wvl = create_endmember_library(
+                output_file='./amd_mapping/data/outputs/endmember_library.sli'
+            )
+        else:
+            hyperion_wvl = load_hyperion_wavelengths(HYPERION_CUBE_PATH)
+            endmembers, hyperion_wvl = create_endmember_library(
+                library_dir='./spectral_library/',
+                hyperion_wavelengths=hyperion_wvl,
+                output_file='./amd_mapping/data/outputs/endmember_library.sli'
+            )
+
+    # ========================================================================
+    # LOAD DATA
+    # ========================================================================
+
+    print("\n=== Loading Data ===")
+
+    # Load Hyperion cube
+    print("Loading Hyperion cube: {}".format(HYPERION_CUBE_PATH))
+    img = envi.open(HYPERION_CUBE_PATH)
+
+    if PROCESS_SUBSET is not None:
+        rows, cols = PROCESS_SUBSET
+        print("  Processing subset: rows {}-{}, cols {}-{}".format(
+            rows[0], rows[1], cols[0], cols[1]))
+        cube = img.read_subregion(rows, cols)
+    else:
+        print("  Processing full image: {} x {} x {} bands".format(
+            img.nrows, img.ncols, img.nbands))
+        cube = img.load()
+        # Only filter bands if we have the full 242-band dataset
+        if img.nbands == 242:
+            usable_bands = get_usable_bands()
+            cube = cube[:, :, usable_bands]
+            print("  Filtered to {} usable bands".format(len(usable_bands)))
+        else:
+            print("  Data already preprocessed with {} bands".format(img.nbands))
+
+    # Convert to numpy array - img.load() returns a memmap-like object
+    print("  Converting spectral image to numpy array...")
+    cube = np.asarray(cube, dtype=np.float32)
+
+    print("  Cube shape: {}".format(cube.shape))
+    print("  Cube type: {}".format(type(cube)))
+
+    # Load endmember library
+    print("Loading endmember library: {}".format(ENDMEMBER_LIBRARY_PATH))
+    library_df = pd.read_csv(ENDMEMBER_LIBRARY_PATH, index_col=0)
+    endmembers = {name: library_df[name].values for name in library_df.columns}
+    print("  Loaded {} minerals: {}".format(len(endmembers), list(endmembers.keys())))
+
+    # ========================================================================
+    # CRITICAL FIX: Scale and Band Alignment (from SAM_Implementation_Report.md)
+    # ========================================================================
+
+    print("\n" + "="*70)
+    print("APPLYING DATA CORRECTIONS")
+    print("="*70)
+
+    # Fix 1: Scale correction
+    cube_valid = cube[cube > 0]
+    if len(cube_valid) > 0:
+        cube_max = np.max(cube_valid)
+        cube_min = np.min(cube_valid)
+        cube_mean = np.mean(cube_valid)
+
+        print("\nCube statistics (valid pixels only):")
+        print("  Min: {:.6f}".format(cube_min))
+        print("  Max: {:.6f}".format(cube_max))
+        print("  Mean: {:.6f}".format(cube_mean))
+
+        if cube_max > 10000:
+            cube = cube / 65535.0
+            print("[OK] Corrected cube scale: /65535")
+        elif cube_max > 2.0:
+            cube = cube / 10000.0
+            print("[OK] Corrected cube scale: /10000")
+        else:
+            print("[OK] Cube scale OK")
+
+    em_max = max(np.max(spec) for spec in endmembers.values())
+    em_min = min(np.min(spec) for spec in endmembers.values())
+    em_mean = np.mean([np.mean(spec) for spec in endmembers.values()])
+
+    print("\nEndmember statistics:")
+    print("  Min: {:.6f}".format(em_min))
+    print("  Max: {:.6f}".format(em_max))
+    print("  Mean: {:.6f}".format(em_mean))
+
+    if em_max > 2.0:
+        endmembers = {name: spec / 10000.0 for name, spec in endmembers.items()}
+        print("[OK] Corrected endmember scale: /10000")
+    else:
+        print("[OK] Endmember scale OK")
+
+    # Fix 2: Band alignment
+    cube_bands = cube.shape[2]
+    endmember_bands = len(list(endmembers.values())[0])
+
+    print("\nBand alignment check:")
+    print("  Cube bands: {}".format(cube_bands))
+    print("  Endmember bands: {}".format(endmember_bands))
+
+    if cube_bands != endmember_bands:
+        if cube_bands > endmember_bands:
+            cube = cube[:, :, :endmember_bands]
+            print("[OK] Trimmed cube bands: {} -> {}".format(cube_bands, endmember_bands))
+        else:
+            print("[ERROR] Cannot proceed (cube bands < endmember bands)")
+            sys.exit(1)
+    else:
+        print("[OK] Band counts match")
+
+    # Fix 3: Validation
+    valid_pixels = np.sum(np.any(cube > 0, axis=2))
+    total_pixels = cube.shape[0] * cube.shape[1]
+    print("[OK] Valid pixels: {:,} ({:.1f}%)".format(valid_pixels, valid_pixels/total_pixels*100))
+
+    # Fix 4: Manual spectral angle test
+    print("\nManual spectral angle test:")
+    test_row, test_col = cube.shape[0]//2, cube.shape[1]//2
+    test_pixel = cube[test_row, test_col, :]
+
+    if np.any(test_pixel > 0):
+        print("  Testing pixel at ({}, {})".format(test_row, test_col))
+
+        for mineral_name in list(endmembers.keys())[:3]:  # Test first 3 minerals
+            test_endmember = endmembers[mineral_name]
+            dot = np.dot(test_pixel, test_endmember)
+            norm_p = np.linalg.norm(test_pixel)
+            norm_e = np.linalg.norm(test_endmember)
+
+            if norm_p > 0 and norm_e > 0:
+                cos_angle = dot / (norm_p * norm_e)
+
+                if abs(cos_angle) > 1.0:
+                    print("  {} vs {}: [ERROR] INVALID cosine ({:.6f}) - Scale mismatch!".format(
+                        "Test pixel", mineral_name, cos_angle))
+                else:
+                    angle = np.arccos(cos_angle)
+                    print("  {} vs {}: {:.4f} rad ({:.1f} deg){}".format(
+                        "Test pixel", mineral_name, angle, np.degrees(angle),
+                        " [OK]" if angle < SAM_THRESHOLD else ""))
+    else:
+        print("  Test pixel is invalid (all zeros)")
+
+    print("="*70 + "\n")
+
+    # ========================================================================
+    # VISUALIZATION: Plot mineral spectra and Hyperion data
+    # ========================================================================
+    print("\n=== GENERATING DIAGNOSTIC PLOTS ===")
+
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend for saving files
+    import matplotlib.pyplot as plt
+    import os
+
+    # Create output directory for plots
+    plot_dir = os.path.join(OUTPUT_DIR, 'diagnostic_plots')
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # Plot 1: All mineral spectra
+    print("Creating mineral spectra plot...")
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    # Get wavelengths from the library index
+    wavelengths = library_df.index.values.astype(float)
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(endmembers)))
+    for idx, (mineral_name, spectrum) in enumerate(endmembers.items()):
+        ax.plot(wavelengths[:len(spectrum)], spectrum, label=mineral_name,
+                linewidth=2, color=colors[idx])
+
+    ax.set_xlabel('Wavelength (nm)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Reflectance', fontsize=12, fontweight='bold')
+    ax.set_title('AMD Mineral Endmember Spectra - {}'.format(DATASET_ID),
+                 fontsize=14, fontweight='bold')
+    ax.legend(fontsize=10, loc='best')
+    ax.grid(True, alpha=0.3)
+
+    # Highlight diagnostic regions
+    ax.axvspan(2200, 2260, alpha=0.15, color='yellow', label='Jarosite (2200-2260nm)')
+    ax.axvspan(850, 950, alpha=0.15, color='red', label='Fe oxides (850-950nm)')
+
+    plt.tight_layout()
+    plot_path = os.path.join(plot_dir, 'mineral_spectra_{}.png'.format(DATASET_ID))
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  Saved: {}".format(plot_path))
+
+    # Plot 2: Individual mineral spectra (separate subplots)
+    print("Creating individual mineral spectra plots...")
+    n_minerals = len(endmembers)
+    n_cols = 3
+    n_rows = int(np.ceil(n_minerals / n_cols))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, n_rows*3))
+    axes = axes.flatten() if n_minerals > 1 else [axes]
+
+    for idx, (mineral_name, spectrum) in enumerate(endmembers.items()):
+        ax = axes[idx]
+        ax.plot(wavelengths[:len(spectrum)], spectrum, linewidth=2, color=colors[idx])
+        ax.set_title(mineral_name, fontsize=11, fontweight='bold')
+        ax.set_xlabel('Wavelength (nm)', fontsize=9)
+        ax.set_ylabel('Reflectance', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim([0, max(1.0, np.max(spectrum) * 1.1)])
+
+    # Hide unused subplots
+    for idx in range(n_minerals, len(axes)):
+        axes[idx].axis('off')
+
+    plt.tight_layout()
+    plot_path = os.path.join(plot_dir, 'mineral_spectra_individual_{}.png'.format(DATASET_ID))
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  Saved: {}".format(plot_path))
+
+    # Plot 3: Hyperion RGB composite (bands as RGB)
+    print("Creating Hyperion RGB composite...")
+    # Select bands for RGB visualization (approximate true color)
+    # Red: ~650nm, Green: ~550nm, Blue: ~450nm
+    # For Hyperion, we'll use bands that approximate these
+
+    if cube.shape[2] >= 50:
+        # Use bands from the visible range
+        red_band = cube[:, :, min(30, cube.shape[2]-1)]
+        green_band = cube[:, :, min(20, cube.shape[2]-1)]
+        blue_band = cube[:, :, min(10, cube.shape[2]-1)]
+
+        # Normalize for display
+        def normalize_band(band):
+            valid = band[band > 0]
+            if len(valid) > 0:
+                p2, p98 = np.percentile(valid, [2, 98])
+                normalized = np.clip((band - p2) / (p98 - p2), 0, 1)
+                return normalized
+            return band
+
+        rgb = np.dstack([
+            normalize_band(red_band),
+            normalize_band(green_band),
+            normalize_band(blue_band)
+        ])
+
+        fig, ax = plt.subplots(figsize=(12, 10))
+        ax.imshow(rgb)
+        ax.set_title('Hyperion RGB Composite - {}'.format(DATASET_ID),
+                     fontsize=14, fontweight='bold')
+        ax.axis('off')
+        plt.tight_layout()
+        plot_path = os.path.join(plot_dir, 'hyperion_rgb_{}.png'.format(DATASET_ID))
+        plt.savefig(plot_path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print("  Saved: {}".format(plot_path))
+
+    # Plot 4: Sample pixel spectra from different locations
+    print("Creating sample pixel spectra plot...")
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    # Sample 5 random valid pixels
+    valid_mask = np.any(cube > 0, axis=2)
+    valid_coords = np.argwhere(valid_mask)
+
+    if len(valid_coords) > 0:
+        sample_indices = np.random.choice(len(valid_coords),
+                                         min(5, len(valid_coords)),
+                                         replace=False)
+
+        for i, idx in enumerate(sample_indices):
+            row, col = valid_coords[idx]
+            pixel_spectrum = cube[row, col, :]
+            ax.plot(wavelengths[:len(pixel_spectrum)], pixel_spectrum,
+                   label='Pixel ({}, {})'.format(row, col),
+                   linewidth=1.5, alpha=0.7)
+
+        ax.set_xlabel('Wavelength (nm)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Reflectance', fontsize=12, fontweight='bold')
+        ax.set_title('Sample Hyperion Pixel Spectra - {}'.format(DATASET_ID), fontsize=14, fontweight='bold')
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plot_path = os.path.join(plot_dir, 'sample_pixel_spectra_{}.png'.format(DATASET_ID))
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print("  Saved: {}".format(plot_path))
+
+    # Plot 5: Mean spectrum of entire image vs minerals
+    print("Creating mean image spectrum comparison...")
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    # Calculate mean spectrum of all valid pixels
+    valid_pixels_array = cube[valid_mask]
+    mean_spectrum = np.mean(valid_pixels_array, axis=0)
+
+    ax.plot(wavelengths[:len(mean_spectrum)], mean_spectrum,
+           label='Mean Image Spectrum', linewidth=3, color='black', alpha=0.8)
+
+    # Overlay mineral spectra (lighter)
+    for idx, (mineral_name, spectrum) in enumerate(endmembers.items()):
+        ax.plot(wavelengths[:len(spectrum)], spectrum,
+               label=mineral_name, linewidth=1.5, alpha=0.5, color=colors[idx])
+
+    ax.set_xlabel('Wavelength (nm)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Reflectance', fontsize=12, fontweight='bold')
+    ax.set_title('Mean Hyperion Spectrum vs Mineral Endmembers - {}'.format(DATASET_ID),
+                 fontsize=14, fontweight='bold')
+    ax.legend(fontsize=9, loc='best')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plot_path = os.path.join(plot_dir, 'mean_spectrum_comparison_{}.png'.format(DATASET_ID))
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print("  Saved: {}".format(plot_path))
+
+    print("\nAll diagnostic plots saved to: {}".format(plot_dir))
+    print("=" * 70 + "\n")
+
+    # ========================================================================
+    # STEP 3: Spectral Enhancement (Optional)
+    # ========================================================================
+
+    if RUN_STEP_3_ENHANCEMENT:
+        print("\n=== STEP 3: Enhancing Spectral Features ===")
+        print("Applying Savitzky-Golay smoothing...")
+        cube_smooth = apply_savgol_smoothing(cube)
+        print("  Done!")
+        # Use smoothed cube for classification
+        cube_for_sam = cube_smooth
+    else:
+        print("\n=== STEP 3: Spectral Enhancement SKIPPED ===")
+        # Use original cube
+        cube_for_sam = cube
+
+    # ========================================================================
+    # STEP 4: SAM Classification
+    # ========================================================================
+
+    class_map = None
+    angle_maps = None
+
+    if RUN_STEP_4_SAM:
+        print("\n=== STEP 4: Running SAM Classification ===")
+        print("Threshold: {} radians".format(SAM_THRESHOLD))
+
+        # Validate inputs before running SAM
+        print("\nValidating SAM inputs...")
+        is_valid, message = validate_sam_inputs(cube_for_sam, endmembers)
+        print("Validation: {}".format(message))
+
+        if not is_valid:
+            print("STOPPING - Fix data issues before running SAM")
+            sys.exit(1)
+
+        class_map, angle_maps = run_sam_all_minerals(
+            cube_for_sam,
+            endmembers,
+            threshold=SAM_THRESHOLD
         )
-        cleaned = clean_classification_map(combined)
-        refined_maps[mineral_name] = cleaned
-    
-    print("=== STEP 7: Validation ===")
-    # Load validation data
-    # Run consistency checks
-    
-    print("=== STEP 8: Final Outputs ===")
-    stats = generate_mineral_statistics(refined_maps, masks={})
-    print(stats)
-    
-    # Export all products
-    export_final_products(refined_maps, './final_outputs/')
-    
-    print("=== WORKFLOW COMPLETE ===")
+
+        print("\nSAM Classification completed!")
+    else:
+        print("\n=== STEP 4: SAM Classification SKIPPED ===")
+
+    # ========================================================================
+    # STEP 5: MTMF for Abundances (Optional)
+    # ========================================================================
+
+    abundance_maps = {}
+
+    if RUN_STEP_5_MTMF:
+        print("\n=== STEP 5: Running MTMF for Abundances ===")
+        for mineral_name, spectrum in endmembers.items():
+            print("  Processing {}...".format(mineral_name))
+            mf_score, infeas = run_mtmf(cube_for_sam, spectrum)
+            abundance_maps[mineral_name] = {
+                'mf_score': mf_score,
+                'infeasibility': infeas
+            }
+        print("MTMF completed!")
+    else:
+        print("\n=== STEP 5: MTMF SKIPPED ===")
+
+    # ========================================================================
+    # STEP 6: Postprocessing (Optional)
+    # ========================================================================
+
+    refined_maps = {}
+
+    if RUN_STEP_6_POSTPROCESSING:
+        print("\n=== STEP 6: Postprocessing ===")
+
+        if class_map is not None and abundance_maps:
+            for idx, mineral_name in enumerate(endmembers.keys(), 1):
+                print("  Cleaning {}...".format(mineral_name))
+                combined = combine_sam_mtmf(
+                    sam_class=class_map,
+                    sam_angle=angle_maps[mineral_name],
+                    mtmf_score=abundance_maps[mineral_name]['mf_score'],
+                    mtmf_infeasibility=abundance_maps[mineral_name]['infeasibility']
+                )
+                cleaned = clean_classification_map(combined)
+                refined_maps[mineral_name] = cleaned
+            print("Postprocessing completed!")
+        else:
+            print("  Skipping - need both SAM and MTMF results")
+    else:
+        print("\n=== STEP 6: Postprocessing SKIPPED ===")
+
+    # ========================================================================
+    # STEP 7: Validation (Optional)
+    # ========================================================================
+
+    if RUN_STEP_7_VALIDATION:
+        print("\n=== STEP 7: Validation ===")
+        print("  Load validation data here...")
+        print("  Run consistency checks here...")
+    else:
+        print("\n=== STEP 7: Validation SKIPPED ===")
+
+    # ========================================================================
+    # STEP 8: Export Results
+    # ========================================================================
+
+    if RUN_STEP_8_EXPORT:
+        print("\n=== STEP 8: Exporting Results ===")
+
+        import os
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+        # Prepare metadata from original image
+        metadata = img.metadata.copy()
+
+        # Export SAM results
+        if class_map is not None:
+            print("Exporting SAM classification map...")
+            output_path = os.path.join(OUTPUT_DIR, 'sam_multiclass_{}.hdr'.format(DATASET_ID))
+            envi.save_image(output_path, class_map, metadata=metadata, force=True)
+            print("  Saved: {}".format(output_path))
+
+            # Fix for SNAP: rename .img to no extension
+            img_file = os.path.join(OUTPUT_DIR, 'sam_multiclass_{}.img'.format(DATASET_ID))
+            noext_file = os.path.join(OUTPUT_DIR, 'sam_multiclass_{}'.format(DATASET_ID))
+            if os.path.exists(img_file) and not os.path.exists(noext_file):
+                import shutil
+                shutil.copy2(img_file, noext_file)
+                print("  [SNAP FIX] Created file without extension for compatibility")
+
+            # Export individual angle maps
+            print("Exporting individual angle maps...")
+            for mineral_name, angle_map in angle_maps.items():
+                output_path = os.path.join(OUTPUT_DIR, 'sam_angle_{}_{}.hdr'.format(mineral_name, DATASET_ID))
+                envi.save_image(output_path, angle_map, metadata=metadata, force=True)
+                print("  Saved: {}".format(output_path))
+
+                # Fix for SNAP: rename .img to no extension
+                img_file = os.path.join(OUTPUT_DIR, 'sam_angle_{}_{}.img'.format(mineral_name, DATASET_ID))
+                noext_file = os.path.join(OUTPUT_DIR, 'sam_angle_{}_{}'.format(mineral_name, DATASET_ID))
+                if os.path.exists(img_file) and not os.path.exists(noext_file):
+                    import shutil
+                    shutil.copy2(img_file, noext_file)
+
+        # Export MTMF results
+        if abundance_maps:
+            print("Exporting MTMF abundance maps...")
+            for mineral_name, maps in abundance_maps.items():
+                output_path = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}_{}.hdr'.format(mineral_name, DATASET_ID))
+                envi.save_image(output_path, maps['mf_score'], metadata=metadata, force=True)
+                print("  Saved: {}".format(output_path))
+
+                # Fix for SNAP: rename .img to no extension
+                img_file = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}_{}.img'.format(mineral_name, DATASET_ID))
+                noext_file = os.path.join(OUTPUT_DIR, 'mtmf_mf_{}_{}'.format(mineral_name, DATASET_ID))
+                if os.path.exists(img_file) and not os.path.exists(noext_file):
+                    import shutil
+                    shutil.copy2(img_file, noext_file)
+
+        # Export refined maps
+        if refined_maps:
+            print("Exporting refined classification maps...")
+            for mineral_name, refined_map in refined_maps.items():
+                output_path = os.path.join(OUTPUT_DIR, 'refined_{}_{}.hdr'.format(mineral_name, DATASET_ID))
+                envi.save_image(output_path, refined_map, metadata=metadata, force=True)
+                print("  Saved: {}".format(output_path))
+
+                # Fix for SNAP: rename .img to no extension
+                img_file = os.path.join(OUTPUT_DIR, 'refined_{}_{}.img'.format(mineral_name, DATASET_ID))
+                noext_file = os.path.join(OUTPUT_DIR, 'refined_{}_{}'.format(mineral_name, DATASET_ID))
+                if os.path.exists(img_file) and not os.path.exists(noext_file):
+                    import shutil
+                    shutil.copy2(img_file, noext_file)
+
+        # Generate and save statistics
+        if class_map is not None:
+            print("\nGenerating classification statistics...")
+            stats_data = []
+            total_pixels = class_map.size
+
+            # Unclassified pixels
+            unclassified = np.sum(class_map == 0)
+            stats_data.append({
+                'Class': 'Unclassified',
+                'Code': 0,
+                'Pixels': unclassified,
+                'Percent': (unclassified / total_pixels) * 100
+            })
+
+            # Each mineral class
+            for idx, mineral_name in enumerate(endmembers.keys(), 1):
+                count = np.sum(class_map == idx)
+                stats_data.append({
+                    'Class': mineral_name,
+                    'Code': idx,
+                    'Pixels': count,
+                    'Percent': (count / total_pixels) * 100
+                })
+
+            stats_df = pd.DataFrame(stats_data)
+            stats_path = os.path.join(OUTPUT_DIR, 'classification_statistics_{}.csv'.format(DATASET_ID))
+            stats_df.to_csv(stats_path, index=False)
+            print("  Saved statistics: {}".format(stats_path))
+            print("\n{}".format(stats_df.to_string(index=False)))
+
+        print("\nAll results exported to: {}".format(OUTPUT_DIR))
+    else:
+        print("\n=== STEP 8: Export SKIPPED ===")
+
+    print("\n" + "=" * 70)
+    print("WORKFLOW COMPLETE!")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main_workflow()

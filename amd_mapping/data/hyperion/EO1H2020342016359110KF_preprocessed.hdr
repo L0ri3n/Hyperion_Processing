@@ -1,0 +1,35 @@
+ENVI
+description = {
+  C:/Lorien/Archivos/TUBAF/1st_Semester/Remote_Sensing/OUT/EO1H2020342016359110KF_preprocessed_tmp}
+samples = 891
+lines = 3311
+bands = 195
+header offset = 0
+file type = ENVI Standard
+data type = 12
+interleave = bip
+byte order = 0
+map info = { UTM , 1 , 1 , 700200 , 4223400 , 29.966329574585 , 29.9909400939941 , 29 , North , WGS-84 }
+coordinate system string = { PROJCS["WGS_1984_UTM_Zone_29N" , GEOGCS["GCS_WGS_1984" , DATUM["D_WGS_1984" , SPHEROID["WGS_1984" , 6378137.0 , 298.257223563]] , PRIMEM["Greenwich" , 0.0] , UNIT["Degree" , 0.0174532925199433]] , PROJECTION["Transverse_Mercator"] , PARAMETER["False_Easting" , 500000.0] , PARAMETER["False_Northing" , 0.0] , PARAMETER["Central_Meridian" , -9.0] , PARAMETER["Scale_Factor" , 0.9996] , PARAMETER["Latitude_Of_Origin" , 0.0] , UNIT["Meter" , 1.0]] }
+band names = { band_1 , band_2 , band_3 , band_4 , band_5 , band_6 , band_7 , band_8 , band_9 , band_10 , band_11 , band_12 , band_13 , band_14 , band_15 , band_16 , band_17 , band_18 , band_19 , band_20 , band_21 , band_22 , band_23 , band_24 , band_25 , band_26 , band_27 , band_28 , band_29 , band_30 , band_31 , band_32 , band_33 , band_34 , band_35 , band_36 , band_37 , band_38 , band_39 , band_40 , band_41 , band_42 , band_43 , band_44 , band_45 , band_46 , band_47 , band_48 , band_49 , band_50 , band_51 , band_52 , band_53 , band_54 , band_55 , band_56 , band_57 , band_58 , band_59 , band_60 , band_61 , band_62 , band_63 , band_64 , band_65 , band_66 , band_67 , band_68 , band_69 , band_70 , band_71 , band_72 , band_73 , band_74 , band_75 , band_76 , band_77 , band_78 , band_79 , band_80 , band_81 , band_82 , band_83 , band_84 , band_85 , band_86 , band_87 , band_88 , band_89 , band_90 , band_91 , band_92 , band_93 , band_94 , band_95 , band_96 , band_97 , band_98 , band_99 , band_100 , band_101 , band_102 , band_103 , band_104 , band_105 , band_106 , band_107 , band_108 , band_109 , band_110 , band_111 , band_112 , band_113 , band_114 , band_115 , band_116 , band_117 , band_118 , band_119 , band_120 , band_121 , band_122 , band_123 , band_124 , band_125 , band_126 , band_127 , band_128 , band_129 , band_130 , band_131 , band_132 , band_133 , band_134 , band_135 , band_136 , band_137 , band_138 , band_139 , band_140 , band_141 , band_142 , band_143 , band_144 , band_145 , band_146 , band_147 , band_148 , band_149 , band_150 , band_151 , band_152 , band_153 , band_154 , band_155 , band_156 , band_157 , band_158 , band_159 , band_160 , band_161 , band_162 , band_163 , band_164 , band_165 , band_166 , band_167 , band_168 , band_169 , band_170 , band_171 , band_172 , band_173 , band_174 , band_175 , band_176 , band_177 , band_178 , band_179 , band_180 , band_181 , band_182 , band_183 , band_184 , band_185 , band_186 , band_187 , band_188 , band_189 , band_190 , band_191 , band_192 , band_193 , band_194 , band_195 }
+data ignore value = 0
+wavelength units = Nanometers
+scale factor = 1000.0
+sun zenith = 81.514021
+sun azimuth = 128.464225
+satellite zenith = -7.3944
+satellite azimuth = 98.2
+center lon = -6.57492
+center lat = 37.7013
+acquisition date = 2016-12-24
+acquisition time start = 2016:359:08:33:43
+acquisition time stop = 2016:359:08:38:02
+id = EO1H2020342016359110KF
+ul_lat = 38.128748
+ul_lon = -6.498997 
+ur_lat = 38.115579
+ur_lon = -6.415030 
+ll_lat = 37.256338
+ll_lon = -6.739303 
+lr_lat = 37.243094
+lr_lon = -6.655926 
