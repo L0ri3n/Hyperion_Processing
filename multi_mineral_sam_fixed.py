@@ -21,7 +21,18 @@ HDR_FILE = str(BASE_DIR / "amd_mapping" / "data" / "hyperion" / "EO1H20203420132
 LIBRARY_FOLDER = str(BASE_DIR / "amd_mapping" / "data" / "spectral_library")
 OUTPUT_FOLDER = str(BASE_DIR / "amd_mapping" / "outputs" / "classifications")
 
-SAM_THRESHOLD = 1.2  # Radians (~5.7°)
+SAM_DEFAULT_THRESHOLD = 0.85   # Radians (~5.7°) — used when no per-mineral value is set
+
+# Per-mineral thresholds (radians). Keys must match CSV filenames (without .csv).
+# Any mineral not listed here will use SAM_DEFAULT_THRESHOLD.
+SAM_THRESHOLDS = {
+     "Goethite_HS36.3_BECKb":                  0.90,
+     "Hematite_GDS27_BECKa":                   1.20,
+     "Jarosite_GDS100_Na_90C_Syn_BECKa":       0.80,
+     "Pyrite_HS35.3_BECKb":                    0.70,
+     "Schwertmannite_BZ93-1_BECKb":            0.95,
+     "Alunite_GDS84_Na03_BECKa":               0.70,
+}
 
 SAVE_INDIVIDUAL_MAPS = True
 SAVE_COMPOSITE_MAP = True
@@ -118,9 +129,15 @@ def main():
     cube = img.load().astype(np.float32)
     rows, cols, bands = cube.shape
     wavelengths = np.array(img.metadata['wavelength'], dtype=float)
-    
+
     print(f"   Image shape: {rows} x {cols} x {bands}")
     print(f"   Wavelength range: {wavelengths.min():.1f} - {wavelengths.max():.1f} nm")
+
+    # Convert from scaled integers to reflectance (0-1)
+    # Hyperion reflectance HDR stores values multiplied by 10000
+    print(f"   Raw value range: {cube.min():.1f} - {cube.max():.1f}")
+    cube /= 10000.0
+    print(f"   After scaling (/10000): {cube.min():.4f} - {cube.max():.4f}")
     
     # Load library
     print(f"\n2. Loading mineral library...")
@@ -146,46 +163,54 @@ def main():
     print(f"\n3. Creating diagnostic plots...")
     create_diagnostic_plots(cube, wavelengths, mineral_names, OUTPUT_FOLDER)
 
+    # Resolve per-mineral thresholds
+    thresholds = {}
+    for name in mineral_names:
+        thresholds[name] = SAM_THRESHOLDS.get(name, SAM_DEFAULT_THRESHOLD)
+
     # Compute SAM for all minerals
-    print(f"\n4. Computing SAM angles (threshold: {SAM_THRESHOLD:.3f} rad = {np.degrees(SAM_THRESHOLD):.1f}°)...")
-    
+    print(f"\n4. Computing SAM angles...")
+    for name in mineral_names:
+        print(f"     {name}: threshold = {thresholds[name]:.3f} rad ({np.degrees(thresholds[name]):.1f}°)")
+
     # Store all SAM results
     sam_angles_dict = {}
     match_scores_dict = {}
-    
+
     for mineral_name in mineral_names:
-        print(f"\n   Processing: {mineral_name}")
-        
+        thr = thresholds[mineral_name]
+        print(f"\n   Processing: {mineral_name} (threshold: {thr:.3f} rad)")
+
         # Compute SAM angles using manual method
         ref_spectrum = mineral_spectra[mineral_name]
         sam_angles = compute_sam_angles_manual(cube, ref_spectrum)
-        
+
         # Compute match score
-        match_score = np.clip(1 - sam_angles / SAM_THRESHOLD, 0, 1)
-        
+        match_score = np.clip(1 - sam_angles / thr, 0, 1)
+
         # Store
         sam_angles_dict[mineral_name] = sam_angles
         match_scores_dict[mineral_name] = match_score
-        
+
         # Statistics
-        pixels_below_threshold = np.sum(sam_angles < SAM_THRESHOLD)
+        pixels_below_threshold = np.sum(sam_angles < thr)
         percent_below = (pixels_below_threshold / sam_angles.size) * 100
-        
+
         print(f"     Min angle: {np.min(sam_angles):.4f} rad")
         print(f"     Mean angle: {np.mean(sam_angles):.4f} rad")
         print(f"     Pixels below threshold: {pixels_below_threshold} ({percent_below:.2f}%)")
         print(f"     Mean match score: {np.mean(match_score):.3f}")
-        
+
         # Save individual map
         if SAVE_INDIVIDUAL_MAPS:
-            save_individual_map(match_score, sam_angles, mineral_name, 
-                              SAM_THRESHOLD, OUTPUT_FOLDER)
-    
+            save_individual_map(match_score, sam_angles, mineral_name,
+                              thr, OUTPUT_FOLDER)
+
     # Create composite classification map
     if SAVE_COMPOSITE_MAP and len(mineral_names) > 0:
         print("\n5. Creating composite classification map...")
-        create_composite_map(sam_angles_dict, match_scores_dict, 
-                           mineral_names, SAM_THRESHOLD, OUTPUT_FOLDER)
+        create_composite_map(sam_angles_dict, match_scores_dict,
+                           mineral_names, thresholds, OUTPUT_FOLDER)
     
     print("\n" + "=" * 70)
     print("PROCESSING COMPLETE!")
@@ -405,62 +430,82 @@ def save_individual_map(match_score, sam_angles, mineral_name, threshold, output
         plt.close()
 
 
-def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, threshold, output_folder):
+def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thresholds, output_folder):
     """
     Create composite classification map using proper SAM classification logic
-    
+
     Classification rules:
-    1. For each pixel, find mineral with SMALLEST SAM angle
-    2. Only classify if that angle is BELOW threshold
-    3. Otherwise, pixel is unclassified (0)
+    1. For each pixel, mask out minerals whose angle >= their own threshold
+    2. Among the remaining candidates, pick the mineral with the smallest angle
+    3. If no mineral passes its threshold, the pixel is unclassified (0)
+
+    Parameters:
+    -----------
+    thresholds : dict
+        Mapping of mineral_name -> threshold (radians)
     """
-    
+
     # Get image dimensions
     rows, cols = list(sam_angles_dict.values())[0].shape
     n_minerals = len(mineral_names)
-    
+
     # Stack all SAM angles into 3D array (rows, cols, n_minerals)
     all_angles = np.zeros((rows, cols, n_minerals))
     for idx, name in enumerate(mineral_names):
         all_angles[:, :, idx] = sam_angles_dict[name]
-    
-    # Find mineral with MINIMUM angle at each pixel
-    min_angle_idx = np.argmin(all_angles, axis=2)
-    min_angle_value = np.min(all_angles, axis=2)
-    
+
+    # Build per-mineral threshold array and broadcast to (1, 1, n_minerals)
+    thr_array = np.array([thresholds[name] for name in mineral_names])
+    thr_broadcast = thr_array[np.newaxis, np.newaxis, :]
+
+    # Mask: True where the mineral passes its own threshold
+    passes = all_angles < thr_broadcast  # (rows, cols, n_minerals)
+
+    # Replace angles that fail their threshold with inf so they can't win
+    masked_angles = np.where(passes, all_angles, np.inf)
+
+    # Among passing minerals, pick the one with the smallest angle
+    min_angle_idx = np.argmin(masked_angles, axis=2)
+    min_angle_value = np.min(masked_angles, axis=2)
+
+    # Pixels where no mineral passed any threshold
+    any_pass = np.any(passes, axis=2)
+
     # Create classification map
-    # Class 0 = unclassified (angle >= threshold)
-    # Class 1, 2, 3... = minerals (angle < threshold)
-    class_map = np.where(min_angle_value < threshold, 
+    # Class 0 = unclassified (no mineral passed its threshold)
+    # Class 1, 2, 3... = minerals
+    class_map = np.where(any_pass,
                          min_angle_idx + 1,  # Mineral class (1-indexed)
                          0)                   # Unclassified
-    
+
     # Visualization
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
-    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
+
     # Plot 1: Classification map
     n_classes = n_minerals + 1
     cmap = plt.cm.get_cmap('tab20', n_classes)
-    
+
     im1 = ax1.imshow(class_map, cmap=cmap, vmin=0, vmax=n_classes-1)
-    ax1.set_title(f'Composite Mineral Classification Map\n'
-                  f'SAM Threshold: {threshold:.3f} rad ({np.degrees(threshold):.1f}°)',
-                  fontsize=14, fontweight='bold')
+    ax1.set_title('Composite Mineral Classification Map', fontsize=14, fontweight='bold')
     ax1.axis('off')
-    
-    # Legend
+
+    # Legend with thresholds embedded in labels
     from matplotlib.patches import Patch
     legend_elements = [Patch(facecolor=cmap(0), label='Unclassified')]
     for idx, name in enumerate(mineral_names):
-        legend_elements.append(Patch(facecolor=cmap(idx+1), label=name))
-    
-    ax1.legend(handles=legend_elements, 
-              loc='center left', 
-              bbox_to_anchor=(1, 0.5),
-              fontsize=10)
-    
+        thr_val = thresholds[name]
+        legend_elements.append(
+            Patch(facecolor=cmap(idx+1),
+                  label=f'{name}  (thr={thr_val:.2f} rad / {np.degrees(thr_val):.1f}\u00b0)'))
+
+    ax1.legend(handles=legend_elements,
+              loc='upper left',
+              bbox_to_anchor=(0, -0.02),
+              fontsize=9, ncol=2, frameon=True)
+
     # Plot 2: Minimum SAM angle map
-    im2 = ax2.imshow(min_angle_value, cmap='viridis', vmin=0, vmax=threshold*2)
+    max_thr = max(thresholds.values())
+    im2 = ax2.imshow(min_angle_value, cmap='viridis', vmin=0, vmax=max_thr*2)
     ax2.set_title('Minimum SAM Angle Map\n(Lower = Better Match)',
                   fontsize=14, fontweight='bold')
     ax2.axis('off')

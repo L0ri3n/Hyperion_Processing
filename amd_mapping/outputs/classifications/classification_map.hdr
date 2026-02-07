@@ -1,0 +1,11 @@
+ENVI
+samples = 881
+lines = 3281
+bands = 1
+header offset = 0
+file type = ENVI Standard
+data type = 12
+interleave = bip
+byte order = 0
+class names = { Unclassified , Alunite_GDS84_Na03_BECKa , Goethite_HS36.3_BECKb , Hematite_GDS27_BECKa , Jarosite_GDS100_Na_90C_Syn_BECKa , Jarosite_GDS99_K_200C_Syn_BECKa , Pyrite_HS35.3_BECKb , Schwertmannite_BZ93-1_BECKb }
+classes = 8
