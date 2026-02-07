@@ -18,10 +18,11 @@ from functools import partial
 # CONFIGURATION
 # =============================================================================
 
-# Paths
-HDR_FILE = r"C:\Lorien\Archivos\TUBAF\1st_Semester\Remote_Sensing\OUT\EO1H2020342013284110KF_reflectance.hdr"
-LIBRARY_FOLDER = r"C:\Lorien\Archivos\TUBAF\1st_Semester\Remote_Sensing\QGIS_TEST\Library_folder"
-OUTPUT_FOLDER = r"C:\Lorien\Archivos\TUBAF\1st_Semester\Remote_Sensing\SAM_Results"
+# Paths (relative to repository root)
+BASE_DIR = Path(__file__).resolve().parent
+HDR_FILE = str(BASE_DIR / "amd_mapping" / "data" / "hyperion" / "EO1H2020342013284110KF_reflectance.hdr")
+LIBRARY_FOLDER = str(BASE_DIR / "amd_mapping" / "data" / "spectral_library")
+OUTPUT_FOLDER = str(BASE_DIR / "amd_mapping" / "outputs" / "classifications")
 
 # SAM Parameters
 SAM_THRESHOLD = 0.1  # Radians (~5.7°)
