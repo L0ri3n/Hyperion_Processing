@@ -21,18 +21,9 @@ HDR_FILE = str(BASE_DIR / "amd_mapping" / "data" / "hyperion" / "EO1H20203420132
 LIBRARY_FOLDER = str(BASE_DIR / "amd_mapping" / "data" / "spectral_library")
 OUTPUT_FOLDER = str(BASE_DIR / "amd_mapping" / "outputs" / "classifications")
 
-SAM_DEFAULT_THRESHOLD = 0.89   # Radians (~5.7°) — used when no per-mineral value is set
-
-# Per-mineral thresholds (radians). Keys must match CSV filenames (without .csv).
-# Any mineral not listed here will use SAM_DEFAULT_THRESHOLD.
-SAM_THRESHOLDS = {
-     "Goethite_HS36.3_BECKb":                  0.88,
-     "Hematite_GDS27_BECKa":                   1.04,
-     "Jarosite_GDS100_Na_90C_Syn_BECKa":       0.86,
-     "Pyrite_HS35.3_BECKb":                    0.71,
-     "Schwertmannite_BZ93-1_BECKb":            0.96,
-     "Alunite_GDS84_Na03_BECKa":               0.70,
-}
+# Threshold margin: each mineral's threshold is set to its minimum SAM angle
+# plus this percentage of that minimum angle.  e.g. 0.15 means +15%.
+SAM_THRESHOLD_MARGIN = 0.05
 
 SAVE_INDIVIDUAL_MAPS = True
 SAVE_COMPOSITE_MAP = True
@@ -163,39 +154,41 @@ def main():
     print(f"\n3. Creating diagnostic plots...")
     create_diagnostic_plots(cube, wavelengths, mineral_names, OUTPUT_FOLDER)
 
-    # Resolve per-mineral thresholds
+    # Compute SAM angles for all minerals
+    print(f"\n4. Computing SAM angles...")
+    sam_angles_dict = {}
+
+    for mineral_name in mineral_names:
+        ref_spectrum = mineral_spectra[mineral_name]
+        sam_angles = compute_sam_angles_manual(cube, ref_spectrum)
+        sam_angles_dict[mineral_name] = sam_angles
+        print(f"   {mineral_name}: min angle = {np.min(sam_angles):.4f} rad")
+
+    # Derive per-mineral thresholds: min_angle * (1 + margin)
+    print(f"\n5. Deriving thresholds (margin = {SAM_THRESHOLD_MARGIN:.0%} above minimum angle)...")
     thresholds = {}
     for name in mineral_names:
-        thresholds[name] = SAM_THRESHOLDS.get(name, SAM_DEFAULT_THRESHOLD)
+        min_angle = np.min(sam_angles_dict[name])
+        thresholds[name] = min_angle * (1 + SAM_THRESHOLD_MARGIN)
+        print(f"     {name}: {thresholds[name]:.4f} rad ({np.degrees(thresholds[name]):.1f}°)")
 
-    # Compute SAM for all minerals
-    print(f"\n4. Computing SAM angles...")
-    for name in mineral_names:
-        print(f"     {name}: threshold = {thresholds[name]:.3f} rad ({np.degrees(thresholds[name]):.1f}°)")
-
-    # Store all SAM results
-    sam_angles_dict = {}
+    # Compute match scores and statistics
+    print(f"\n6. Computing match scores...")
     match_scores_dict = {}
 
     for mineral_name in mineral_names:
         thr = thresholds[mineral_name]
-        print(f"\n   Processing: {mineral_name} (threshold: {thr:.3f} rad)")
-
-        # Compute SAM angles using manual method
-        ref_spectrum = mineral_spectra[mineral_name]
-        sam_angles = compute_sam_angles_manual(cube, ref_spectrum)
+        sam_angles = sam_angles_dict[mineral_name]
 
         # Compute match score
         match_score = np.clip(1 - sam_angles / thr, 0, 1)
-
-        # Store
-        sam_angles_dict[mineral_name] = sam_angles
         match_scores_dict[mineral_name] = match_score
 
         # Statistics
         pixels_below_threshold = np.sum(sam_angles < thr)
         percent_below = (pixels_below_threshold / sam_angles.size) * 100
 
+        print(f"\n   {mineral_name} (threshold: {thr:.4f} rad)")
         print(f"     Min angle: {np.min(sam_angles):.4f} rad")
         print(f"     Mean angle: {np.mean(sam_angles):.4f} rad")
         print(f"     Pixels below threshold: {pixels_below_threshold} ({percent_below:.2f}%)")
@@ -208,7 +201,7 @@ def main():
 
     # Create composite classification map
     if SAVE_COMPOSITE_MAP and len(mineral_names) > 0:
-        print("\n5. Creating composite classification map...")
+        print("\n7. Creating composite classification map...")
         create_composite_map(sam_angles_dict, match_scores_dict,
                            mineral_names, thresholds, OUTPUT_FOLDER)
     
