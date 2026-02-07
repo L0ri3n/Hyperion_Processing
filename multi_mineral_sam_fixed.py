@@ -21,16 +21,16 @@ HDR_FILE = str(BASE_DIR / "amd_mapping" / "data" / "hyperion" / "EO1H20203420132
 LIBRARY_FOLDER = str(BASE_DIR / "amd_mapping" / "data" / "spectral_library")
 OUTPUT_FOLDER = str(BASE_DIR / "amd_mapping" / "outputs" / "classifications")
 
-SAM_DEFAULT_THRESHOLD = 0.85   # Radians (~5.7°) — used when no per-mineral value is set
+SAM_DEFAULT_THRESHOLD = 0.89   # Radians (~5.7°) — used when no per-mineral value is set
 
 # Per-mineral thresholds (radians). Keys must match CSV filenames (without .csv).
 # Any mineral not listed here will use SAM_DEFAULT_THRESHOLD.
 SAM_THRESHOLDS = {
-     "Goethite_HS36.3_BECKb":                  0.90,
-     "Hematite_GDS27_BECKa":                   1.20,
-     "Jarosite_GDS100_Na_90C_Syn_BECKa":       0.80,
-     "Pyrite_HS35.3_BECKb":                    0.70,
-     "Schwertmannite_BZ93-1_BECKb":            0.95,
+     "Goethite_HS36.3_BECKb":                  0.88,
+     "Hematite_GDS27_BECKa":                   1.04,
+     "Jarosite_GDS100_Na_90C_Syn_BECKa":       0.86,
+     "Pyrite_HS35.3_BECKb":                    0.71,
+     "Schwertmannite_BZ93-1_BECKb":            0.96,
      "Alunite_GDS84_Na03_BECKa":               0.70,
 }
 
