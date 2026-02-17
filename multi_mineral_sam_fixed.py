@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import spectral as sp
 from scipy.interpolate import interp1d
+from scipy.ndimage import median_filter
+from skimage.morphology import binary_opening, binary_closing, disk
 import matplotlib.pyplot as plt
 from pathlib import Path
 import glob
@@ -23,11 +25,59 @@ OUTPUT_FOLDER = str(BASE_DIR / "amd_mapping" / "outputs" / "classifications")
 
 # Threshold margin: each mineral's threshold is set to its minimum SAM angle
 # plus this percentage of that minimum angle.  e.g. 0.15 means +15%.
-SAM_THRESHOLD_MARGIN = 0.05
+SAM_THRESHOLD_MARGIN = 0.01
+
+# Pre-classification: index-based soil masking
+# Pixels with NDVI >= this value are considered vegetation and excluded
+NDVI_THRESHOLD = 0.40
+# Pixels with MNDWI >= this value are considered water and excluded
+MNDWI_THRESHOLD = 0.0
+# Median filter kernel size (pixels) for cleaning the soil mask
+SOIL_MASK_MEDIAN_SIZE = 3
+# Morphological disk radius for opening/closing cleanup
+SOIL_MASK_MORPH_RADIUS = 2
 
 SAVE_INDIVIDUAL_MAPS = True
 SAVE_COMPOSITE_MAP = True
 SHOW_PLOTS = False
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def short_mineral_name(full_name):
+    """Derive a concise, unique display name from a spectral library filename.
+
+    Handles duplicate base names (e.g. two Jarosite variants) by appending
+    a distinguishing token such as '(Na)' or '(K)'.
+    """
+    parts = full_name.split('_')
+    base = parts[0]                         # e.g. "Jarosite"
+    rest = '_'.join(parts[1:]).upper()       # e.g. "GDS100_NA_90C_SYN_BECKA"
+    # Disambiguate Na- vs K-jarosite (or similar duplicates)
+    if 'JAROSITE' in base.upper():
+        if '_NA_' in f'_{rest}_' or '_NA0' in rest:
+            return f'{base} (Na)'
+        if '_K_' in f'_{rest}_':
+            return f'{base} (K)'
+    return base
+
+
+# Maximally distinct palette for up to 10 mineral classes.
+# Based on Tableau-10 / colorbrewer qualitative schemes.
+MINERAL_COLORS = [
+    '#E66101',  # orange        – Alunite
+    '#5E3C99',  # purple        – Goethite
+    '#D62728',  # red           – Hematite
+    '#1F77B4',  # blue          – Jarosite (Na)
+    '#17BECF',  # cyan          – Jarosite (K)
+    '#BCBD22',  # yellow-green  – Pyrite
+    '#2CA02C',  # green         – Schwertmannite
+    '#E7298A',  # magenta       (spare)
+    '#A6761D',  # brown         (spare)
+    '#666666',  # grey          (spare)
+]
+
 
 # =============================================================================
 # CORE SAM FUNCTIONS
@@ -102,6 +152,75 @@ def load_and_resample_spectrum(csv_path, wavelengths):
 
 
 # =============================================================================
+# PRE-CLASSIFICATION: SOIL MASKING
+# =============================================================================
+
+def compute_soil_mask(cube, wavelengths):
+    """
+    Create a binary soil mask using NDVI and MNDWI index thresholding,
+    followed by median filtering and morphological cleanup.
+
+    Soil pixels = low NDVI (not vegetation) AND low MNDWI (not water)
+    AND valid reflectance (not background/nodata).
+
+    Parameters
+    ----------
+    cube : ndarray (rows, cols, bands)
+        Reflectance image cube (0-1 scale).
+    wavelengths : ndarray (bands,)
+        Wavelengths in nm.
+
+    Returns
+    -------
+    soil_mask : ndarray (rows, cols), bool
+        True for soil pixels, False for vegetation/water/nodata.
+    ndvi : ndarray (rows, cols)
+        NDVI values (for diagnostics).
+    mndwi : ndarray (rows, cols)
+        MNDWI values (for diagnostics).
+    """
+    # --- find nearest bands ---
+    red_idx = np.argmin(np.abs(wavelengths - 660))
+    nir_idx = np.argmin(np.abs(wavelengths - 860))
+    green_idx = np.argmin(np.abs(wavelengths - 550))
+    swir_idx = np.argmin(np.abs(wavelengths - 1600))
+
+    red = cube[:, :, red_idx].astype(np.float64)
+    nir = cube[:, :, nir_idx].astype(np.float64)
+    green = cube[:, :, green_idx].astype(np.float64)
+    swir = cube[:, :, swir_idx].astype(np.float64)
+
+    # --- NDVI: (NIR - Red) / (NIR + Red) ---
+    ndvi_denom = nir + red
+    ndvi = np.where(ndvi_denom > 0, (nir - red) / ndvi_denom, 0.0)
+
+    # --- MNDWI (Xu 2006): (Green - SWIR) / (Green + SWIR) ---
+    # Uses SWIR ~1600nm instead of NIR for much better water/land contrast
+    mndwi_denom = green + swir
+    mndwi = np.where(mndwi_denom > 0, (green - swir) / mndwi_denom, 0.0)
+
+    # --- valid-data mask (exclude background / nodata pixels) ---
+    pixel_norms = np.linalg.norm(cube.reshape(-1, cube.shape[2]), axis=1)
+    valid_mask = (pixel_norms > 0).reshape(cube.shape[0], cube.shape[1])
+
+    # --- thresholding ---
+    not_vegetation = ndvi < NDVI_THRESHOLD
+    not_water = mndwi < MNDWI_THRESHOLD
+    soil_mask = valid_mask & not_vegetation & not_water
+
+    # --- median filter to remove salt-and-pepper noise ---
+    soil_mask = median_filter(soil_mask.astype(np.uint8),
+                              size=SOIL_MASK_MEDIAN_SIZE).astype(bool)
+
+    # --- morphological opening then closing for shape cleanup ---
+    selem = disk(SOIL_MASK_MORPH_RADIUS)
+    soil_mask = binary_opening(soil_mask, selem)
+    soil_mask = binary_closing(soil_mask, selem)
+
+    return soil_mask, ndvi, mndwi
+
+
+# =============================================================================
 # MAIN PROCESSING
 # =============================================================================
 
@@ -154,26 +273,46 @@ def main():
     print(f"\n3. Creating diagnostic plots...")
     create_diagnostic_plots(cube, wavelengths, mineral_names, OUTPUT_FOLDER)
 
-    # Compute SAM angles for all minerals
-    print(f"\n4. Computing SAM angles...")
+    # Pre-classification: compute soil mask
+    print(f"\n4. Pre-classification: computing soil mask...")
+    print(f"   NDVI threshold: {NDVI_THRESHOLD}  (pixels >= this are vegetation)")
+    print(f"   MNDWI threshold: {MNDWI_THRESHOLD}  (pixels >= this are water)")
+    print(f"   Median filter size: {SOIL_MASK_MEDIAN_SIZE}")
+    print(f"   Morphological disk radius: {SOIL_MASK_MORPH_RADIUS}")
+    soil_mask, ndvi, mndwi = compute_soil_mask(cube, wavelengths)
+    n_soil = np.sum(soil_mask)
+    n_total = soil_mask.size
+    print(f"   Soil pixels: {n_soil} / {n_total} ({n_soil / n_total * 100:.1f}%)")
+    print(f"   Excluded pixels: {n_total - n_soil} ({(n_total - n_soil) / n_total * 100:.1f}%)")
+
+    # Save soil mask diagnostic plot
+    print(f"\n5. Saving pre-classification diagnostics...")
+    save_soil_mask_plot(soil_mask, ndvi, mndwi, OUTPUT_FOLDER)
+
+    # Compute SAM angles for all minerals (only on soil pixels)
+    print(f"\n6. Computing SAM angles (soil pixels only)...")
     sam_angles_dict = {}
 
     for mineral_name in mineral_names:
         ref_spectrum = mineral_spectra[mineral_name]
         sam_angles = compute_sam_angles_manual(cube, ref_spectrum)
+        # Set non-soil pixels to pi (maximum angle) so they are never classified
+        sam_angles[~soil_mask] = np.pi
         sam_angles_dict[mineral_name] = sam_angles
-        print(f"   {mineral_name}: min angle = {np.min(sam_angles):.4f} rad")
+        soil_min = np.min(sam_angles[soil_mask]) if n_soil > 0 else np.nan
+        print(f"   {mineral_name}: min angle (soil only) = {soil_min:.4f} rad")
 
     # Derive per-mineral thresholds: min_angle * (1 + margin)
-    print(f"\n5. Deriving thresholds (margin = {SAM_THRESHOLD_MARGIN:.0%} above minimum angle)...")
+    print(f"\n7. Deriving thresholds (margin = {SAM_THRESHOLD_MARGIN:.0%} above minimum angle)...")
     thresholds = {}
     for name in mineral_names:
-        min_angle = np.min(sam_angles_dict[name])
+        soil_angles = sam_angles_dict[name][soil_mask]
+        min_angle = np.min(soil_angles) if len(soil_angles) > 0 else np.pi
         thresholds[name] = min_angle * (1 + SAM_THRESHOLD_MARGIN)
         print(f"     {name}: {thresholds[name]:.4f} rad ({np.degrees(thresholds[name]):.1f}°)")
 
     # Compute match scores and statistics
-    print(f"\n6. Computing match scores...")
+    print(f"\n8. Computing match scores...")
     match_scores_dict = {}
 
     for mineral_name in mineral_names:
@@ -201,9 +340,9 @@ def main():
 
     # Create composite classification map
     if SAVE_COMPOSITE_MAP and len(mineral_names) > 0:
-        print("\n7. Creating composite classification map...")
+        print("\n9. Creating composite classification map...")
         create_composite_map(sam_angles_dict, match_scores_dict,
-                           mineral_names, thresholds, OUTPUT_FOLDER)
+                           mineral_names, thresholds, soil_mask, OUTPUT_FOLDER)
     
     print("\n" + "=" * 70)
     print("PROCESSING COMPLETE!")
@@ -390,52 +529,197 @@ def create_diagnostic_plots(cube, wavelengths, mineral_names, output_folder):
     print(f"     Diagnostic plots saved to: {diag_dir}")
 
 
-def save_individual_map(match_score, sam_angles, mineral_name, threshold, output_folder):
-    """Save individual mineral detection map"""
-    
-    # Create figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-    
-    # Plot 1: Match score (like your working script)
-    im1 = ax1.imshow(match_score, cmap='inferno', vmin=0, vmax=1)
-    ax1.set_title(f'{mineral_name} - Match Score\nThreshold: {threshold:.3f} rad ({np.degrees(threshold):.1f}°)',
-                  fontsize=12, fontweight='bold')
-    ax1.axis('off')
-    cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
-    cbar1.set_label('Match Score (0=no match, 1=perfect)', fontsize=10)
-    
-    # Plot 2: Binary detection
-    binary_detection = (sam_angles < threshold).astype(float)
-    im2 = ax2.imshow(binary_detection, cmap='RdYlGn', vmin=0, vmax=1)
-    ax2.set_title(f'{mineral_name} - Binary Detection\n(Green = Detected, Red = Not Detected)',
-                  fontsize=12, fontweight='bold')
-    ax2.axis('off')
-    cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
-    cbar2.set_label('Detection (0=absent, 1=present)', fontsize=10)
-    
-    plt.tight_layout()
-    
-    output_path = Path(output_folder) / f"{mineral_name}_SAM_results.png"
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    print(f"     Saved: {output_path.name}")
-    
+def save_soil_mask_plot(soil_mask, ndvi, mndwi, output_folder):
+    """Save publication-quality pre-classification soil mask figure."""
+    from matplotlib.patches import Patch
+
+    diag_dir = Path(output_folder) / "diagnostic_plots"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- build a valid-data mask (any pixel with nonzero index or soil flag) ---
+    valid = (ndvi != 0) | (mndwi != 0) | soil_mask
+
+    # Masked arrays so nodata renders as white (the axes facecolor)
+    ndvi_m = np.ma.masked_where(~valid, ndvi)
+    mndwi_m = np.ma.masked_where(~valid, mndwi)
+
+    # --- figure setup ---
+    fig, axes = plt.subplots(2, 2, figsize=(7.0, 9.5),
+                             gridspec_kw={'hspace': 0.28, 'wspace': 0.30})
+    for ax in axes.flat:
+        ax.set_facecolor('white')
+
+    panel_labels = ['(a)', '(b)', '(c)', '(d)']
+
+    # ---- (a) NDVI ----
+    ax = axes[0, 0]
+    im0 = ax.imshow(ndvi_m, cmap='RdYlGn', vmin=-0.2, vmax=0.8,
+                    interpolation='nearest')
+    ax.axhline(y=0, color='none')  # force extent
+    cbar0 = plt.colorbar(im0, ax=ax, fraction=0.046, pad=0.04)
+    cbar0.set_label('NDVI', fontsize=8)
+    cbar0.ax.tick_params(labelsize=7)
+    ax.set_title(f'NDVI  (threshold = {NDVI_THRESHOLD})', fontsize=9)
+    ax.text(0.02, 0.97, panel_labels[0], transform=ax.transAxes,
+            fontsize=10, fontweight='bold', va='top', ha='left',
+            bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
+    ax.axis('off')
+
+    # ---- (b) MNDWI ----
+    ax = axes[0, 1]
+    im1 = ax.imshow(mndwi_m, cmap='RdBu', vmin=-0.5, vmax=0.5,
+                    interpolation='nearest')
+    cbar1 = plt.colorbar(im1, ax=ax, fraction=0.046, pad=0.04)
+    cbar1.set_label('MNDWI', fontsize=8)
+    cbar1.ax.tick_params(labelsize=7)
+    ax.set_title(f'MNDWI  (threshold = {MNDWI_THRESHOLD})', fontsize=9)
+    ax.text(0.02, 0.97, panel_labels[1], transform=ax.transAxes,
+            fontsize=10, fontweight='bold', va='top', ha='left',
+            bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
+    ax.axis('off')
+
+    # ---- (c) Pre-classification overlay ----
+    ax = axes[1, 0]
+    # RGBA overlay: white background, then fill classes
+    rgba_overlay = np.ones((*soil_mask.shape, 4))  # white + fully opaque
+    # water takes priority over vegetation (MNDWI is the more specific discriminator)
+    wat_mask = valid & (mndwi >= MNDWI_THRESHOLD)
+    veg_mask = valid & (ndvi >= NDVI_THRESHOLD) & ~wat_mask
+    nodata_mask = ~valid
+
+    rgba_overlay[veg_mask]   = [0.20, 0.60, 0.20, 1.0]   # muted green
+    rgba_overlay[wat_mask]   = [0.20, 0.40, 0.75, 1.0]   # muted blue
+    rgba_overlay[soil_mask]  = [0.76, 0.56, 0.33, 1.0]   # earth brown
+    rgba_overlay[nodata_mask] = [1.0, 1.0, 1.0, 1.0]     # white
+
+    ax.imshow(rgba_overlay, interpolation='nearest')
+    ax.set_title('Index-based pre-classification', fontsize=9)
+    ax.text(0.02, 0.97, panel_labels[2], transform=ax.transAxes,
+            fontsize=10, fontweight='bold', va='top', ha='left',
+            bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
+    ax.axis('off')
+
+    # Legend for overlay
+    legend_patches = [
+        Patch(facecolor=(0.76, 0.56, 0.33), edgecolor='k', linewidth=0.4, label='Bare soil'),
+        Patch(facecolor=(0.20, 0.60, 0.20), edgecolor='k', linewidth=0.4, label='Vegetation'),
+        Patch(facecolor=(0.20, 0.40, 0.75), edgecolor='k', linewidth=0.4, label='Water'),
+    ]
+    ax.legend(handles=legend_patches, loc='lower right', fontsize=7,
+              frameon=True, fancybox=False, edgecolor='0.4',
+              handlelength=1.2, handleheight=0.9)
+
+    # ---- (d) Final soil mask (binary) ----
+    ax = axes[1, 1]
+    mask_rgba = np.where(valid[..., None],
+                         np.where(soil_mask[..., None],
+                                  np.array([0.55, 0.37, 0.24, 1.0]),   # dark brown
+                                  np.array([0.85, 0.85, 0.85, 1.0])),  # light gray = excluded valid
+                         np.array([1.0, 1.0, 1.0, 1.0]))               # white = nodata
+    ax.imshow(mask_rgba, interpolation='nearest')
+    n_soil = int(np.sum(soil_mask))
+    n_valid = int(np.sum(valid))
+    ax.set_title(
+        f'Soil mask (filtered)\n'
+        f'{n_soil:,} px / {n_valid:,} valid ({n_soil / max(n_valid, 1) * 100:.1f}%)',
+        fontsize=9)
+    ax.text(0.02, 0.97, panel_labels[3], transform=ax.transAxes,
+            fontsize=10, fontweight='bold', va='top', ha='left',
+            bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
+    ax.axis('off')
+
+    legend_patches_d = [
+        Patch(facecolor=(0.55, 0.37, 0.24), edgecolor='k', linewidth=0.4, label='Soil'),
+        Patch(facecolor=(0.85, 0.85, 0.85), edgecolor='k', linewidth=0.4, label='Excluded'),
+    ]
+    ax.legend(handles=legend_patches_d, loc='lower right', fontsize=7,
+              frameon=True, fancybox=False, edgecolor='0.4',
+              handlelength=1.2, handleheight=0.9)
+
+    out_path = diag_dir / "pre_classification_soil_mask.png"
+    plt.savefig(out_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"     Saved: {out_path}")
     if not SHOW_PLOTS:
         plt.close()
 
 
-def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thresholds, output_folder):
+def save_individual_map(match_score, sam_angles, mineral_name, threshold, output_folder):
+    """Save publication-quality individual mineral detection map."""
+    short_name = short_mineral_name(mineral_name)
+
+    # Mask nodata (sam_angles == pi means non-soil or nodata)
+    is_nodata = sam_angles >= np.pi
+    match_m = np.ma.masked_where(is_nodata, match_score)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.5, 5.0))
+    for ax in (ax1, ax2):
+        ax.set_facecolor('white')
+
+    # (a) Match score
+    im1 = ax1.imshow(match_m, cmap='inferno', vmin=0, vmax=1, interpolation='nearest')
+    ax1.set_title(
+        f'{short_name} \u2014 match score\n'
+        f'(threshold {threshold:.3f} rad / {np.degrees(threshold):.1f}\u00b0)',
+        fontsize=9)
+    ax1.text(0.02, 0.97, '(a)', transform=ax1.transAxes,
+             fontsize=10, fontweight='bold', va='top',
+             bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
+    ax1.axis('off')
+    cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+    cbar1.set_label('Match score', fontsize=8)
+    cbar1.ax.tick_params(labelsize=7)
+
+    # (b) Binary detection — RGBA for clean nodata handling
+    detected = sam_angles < threshold
+    rgba_det = np.ones((*sam_angles.shape, 4), dtype=np.float32)  # white bg
+    rgba_det[~is_nodata & ~detected] = [0.85, 0.85, 0.85, 1.0]   # light gray = not detected
+    rgba_det[detected] = [0.13, 0.55, 0.13, 1.0]                  # forest green = detected
+    ax2.imshow(rgba_det, interpolation='nearest')
+    n_det = int(np.sum(detected))
+    ax2.set_title(
+        f'{short_name} \u2014 binary detection\n'
+        f'{n_det:,} pixels detected',
+        fontsize=9)
+    ax2.text(0.02, 0.97, '(b)', transform=ax2.transAxes,
+             fontsize=10, fontweight='bold', va='top',
+             bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
+    ax2.axis('off')
+
+    from matplotlib.patches import Patch
+    ax2.legend(
+        handles=[
+            Patch(fc=(0.13, 0.55, 0.13), ec='0.3', lw=0.4, label='Detected'),
+            Patch(fc=(0.85, 0.85, 0.85), ec='0.3', lw=0.4, label='Not detected'),
+        ],
+        loc='lower right', fontsize=7,
+        frameon=True, fancybox=False, edgecolor='0.4',
+        handlelength=1.0, handleheight=0.8)
+
+    plt.tight_layout()
+    output_path = Path(output_folder) / f"{mineral_name}_SAM_results.png"
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"     Saved: {output_path.name}")
+
+    if not SHOW_PLOTS:
+        plt.close()
+
+
+def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thresholds, soil_mask, output_folder):
     """
     Create composite classification map using proper SAM classification logic
 
     Classification rules:
-    1. For each pixel, mask out minerals whose angle >= their own threshold
-    2. Among the remaining candidates, pick the mineral with the smallest angle
-    3. If no mineral passes its threshold, the pixel is unclassified (0)
+    1. Only soil-masked pixels are candidates for classification
+    2. For each pixel, mask out minerals whose angle >= their own threshold
+    3. Among the remaining candidates, pick the mineral with the smallest angle
+    4. If no mineral passes its threshold, the pixel is unclassified (0)
 
     Parameters:
     -----------
     thresholds : dict
         Mapping of mineral_name -> threshold (radians)
+    soil_mask : ndarray (rows, cols), bool
+        True for soil pixels eligible for SAM classification
     """
 
     # Get image dimensions
@@ -465,53 +749,140 @@ def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thre
     any_pass = np.any(passes, axis=2)
 
     # Create classification map
-    # Class 0 = unclassified (no mineral passed its threshold)
+    # Class 0 = unclassified (no mineral passed its threshold or non-soil)
     # Class 1, 2, 3... = minerals
-    class_map = np.where(any_pass,
+    class_map = np.where(any_pass & soil_mask,
                          min_angle_idx + 1,  # Mineral class (1-indexed)
                          0)                   # Unclassified
 
-    # Visualization
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 10))
-
-    # Plot 1: Classification map
-    n_classes = n_minerals + 1
-    cmap = plt.cm.get_cmap('tab20', n_classes)
-
-    im1 = ax1.imshow(class_map, cmap=cmap, vmin=0, vmax=n_classes-1)
-    ax1.set_title('Composite Mineral Classification Map', fontsize=14, fontweight='bold')
-    ax1.axis('off')
-
-    # Legend with thresholds embedded in labels
+    # =====================================================================
+    # Publication-quality visualization
+    # =====================================================================
     from matplotlib.patches import Patch
-    legend_elements = [Patch(facecolor=cmap(0), label='Unclassified')]
+    import matplotlib.gridspec as gridspec
+
+    mineral_rgb = MINERAL_COLORS
+
+    # Nodata / soil-but-unclassified / background distinction
+    # has_data: any pixel with data (SAM angle < pi means it was not masked out)
+    has_data = np.any(np.abs(
+        np.stack([sam_angles_dict[n] for n in mineral_names], axis=-1)) < np.pi, axis=-1) | soil_mask
+
+    # Build RGBA image manually for full control
+    rgba = np.ones((rows, cols, 4), dtype=np.float32)  # white background
+
+    # Layer 1: non-soil valid pixels -> very light gray
+    rgba[has_data & ~soil_mask] = [0.92, 0.92, 0.92, 1.0]
+
+    # Layer 2: soil but unclassified -> medium gray
+    soil_unclass = soil_mask & (class_map == 0)
+    rgba[soil_unclass] = [0.75, 0.75, 0.75, 1.0]
+
+    # Layer 3: classified minerals
+    for idx, name in enumerate(mineral_names):
+        c = mineral_rgb[idx % len(mineral_rgb)]
+        r_val = int(c[1:3], 16) / 255.0
+        g_val = int(c[3:5], 16) / 255.0
+        b_val = int(c[5:7], 16) / 255.0
+        mask = class_map == (idx + 1)
+        rgba[mask] = [r_val, g_val, b_val, 1.0]
+
+    # --- Layout: classification map (large) + SAM angle map + threshold table ---
+    fig = plt.figure(figsize=(7.5, 10.0))
+    gs = gridspec.GridSpec(2, 2, height_ratios=[1, 1],
+                           hspace=0.22, wspace=0.25)
+
+    # (a) Classification map — spans left column
+    ax_class = fig.add_subplot(gs[:, 0])
+    ax_class.imshow(rgba, interpolation='nearest')
+    ax_class.set_title('Mineral classification (SAM)', fontsize=9)
+    ax_class.text(0.02, 0.98, '(a)', transform=ax_class.transAxes,
+                  fontsize=10, fontweight='bold', va='top',
+                  bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
+    ax_class.axis('off')
+
+    # Legend
+    legend_elements = [
+        Patch(fc='white', ec='0.5', lw=0.4, label='No data'),
+        Patch(fc=(0.92, 0.92, 0.92), ec='0.5', lw=0.4, label='Non-soil (masked)'),
+        Patch(fc=(0.75, 0.75, 0.75), ec='0.5', lw=0.4, label='Soil (unclassified)'),
+    ]
+    for idx, name in enumerate(mineral_names):
+        c = mineral_rgb[idx % len(mineral_rgb)]
+        short_name = short_mineral_name(name)
+        legend_elements.append(
+            Patch(fc=c, ec='0.3', lw=0.4, label=short_name))
+
+    ax_class.legend(handles=legend_elements,
+                    loc='lower right', fontsize=6.5,
+                    frameon=True, fancybox=False, edgecolor='0.4',
+                    handlelength=1.0, handleheight=0.8,
+                    borderpad=0.4, labelspacing=0.35)
+
+    # (b) Minimum SAM angle — soil pixels only
+    ax_sam = fig.add_subplot(gs[0, 1])
+    sam_display = np.ma.masked_where(~soil_mask, min_angle_value)
+    max_thr = max(thresholds.values())
+    im_sam = ax_sam.imshow(sam_display, cmap='magma_r', vmin=0,
+                           vmax=max_thr * 1.5, interpolation='nearest')
+    ax_sam.set_title('Minimum SAM angle (soil pixels)', fontsize=9)
+    ax_sam.text(0.02, 0.98, '(b)', transform=ax_sam.transAxes,
+                fontsize=10, fontweight='bold', va='top',
+                bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
+    ax_sam.axis('off')
+    cbar = plt.colorbar(im_sam, ax=ax_sam, fraction=0.046, pad=0.04)
+    cbar.set_label('Angle (rad)', fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+
+    # (c) Threshold summary table
+    ax_tbl = fig.add_subplot(gs[1, 1])
+    ax_tbl.axis('off')
+    ax_tbl.set_title('SAM thresholds per mineral', fontsize=9)
+    ax_tbl.text(0.02, 0.98, '(c)', transform=ax_tbl.transAxes,
+                fontsize=10, fontweight='bold', va='top',
+                bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
+
+    col_labels = ['Mineral', 'Thr (rad)', 'Thr (\u00b0)', 'Pixels', '%']
+    table_data = []
+    total_classified = 0
     for idx, name in enumerate(mineral_names):
         thr_val = thresholds[name]
-        legend_elements.append(
-            Patch(facecolor=cmap(idx+1),
-                  label=f'{name}  (thr={thr_val:.2f} rad / {np.degrees(thr_val):.1f}\u00b0)'))
+        count = int(np.sum(class_map == idx + 1))
+        total_classified += count
+        short = short_mineral_name(name)
+        table_data.append([
+            short,
+            f'{thr_val:.3f}',
+            f'{np.degrees(thr_val):.1f}',
+            f'{count:,}',
+            f'{count / max(int(np.sum(soil_mask)), 1) * 100:.1f}'
+        ])
 
-    ax1.legend(handles=legend_elements,
-              loc='upper left',
-              bbox_to_anchor=(0, -0.02),
-              fontsize=9, ncol=2, frameon=True)
+    tbl = ax_tbl.table(cellText=table_data, colLabels=col_labels,
+                       loc='center', cellLoc='center')
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(6.5)
+    tbl.scale(1.0, 1.2)
 
-    # Plot 2: Minimum SAM angle map
-    max_thr = max(thresholds.values())
-    im2 = ax2.imshow(min_angle_value, cmap='viridis', vmin=0, vmax=max_thr*2)
-    ax2.set_title('Minimum SAM Angle Map\n(Lower = Better Match)',
-                  fontsize=14, fontweight='bold')
-    ax2.axis('off')
-    cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
-    cbar2.set_label('SAM Angle (radians)', fontsize=10)
-    
-    plt.tight_layout()
-    
+    # Style header row
+    for j in range(len(col_labels)):
+        cell = tbl[0, j]
+        cell.set_text_props(fontweight='bold', fontsize=7)
+        cell.set_facecolor('#e0e0e0')
+        cell.set_edgecolor('0.4')
+
+    # Color-code mineral rows
+    for i, name in enumerate(mineral_names):
+        c = mineral_rgb[i % len(mineral_rgb)]
+        tbl[i + 1, 0].set_facecolor(c + '30')  # 30 = ~19% alpha in hex
+        for j in range(len(col_labels)):
+            tbl[i + 1, j].set_edgecolor('0.6')
+
     # Save
     output_path = Path(output_folder) / "Composite_Classification_Map.png"
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"  Saved: {output_path.name}")
-    
+
     if not SHOW_PLOTS:
         plt.close()
     
