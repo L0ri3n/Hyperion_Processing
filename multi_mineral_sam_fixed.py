@@ -605,9 +605,10 @@ def save_soil_mask_plot(soil_mask, ndvi, mndwi, output_folder):
         Patch(facecolor=(0.20, 0.60, 0.20), edgecolor='k', linewidth=0.4, label='Vegetation'),
         Patch(facecolor=(0.20, 0.40, 0.75), edgecolor='k', linewidth=0.4, label='Water'),
     ]
-    ax.legend(handles=legend_patches, loc='lower right', fontsize=7,
+    ax.legend(handles=legend_patches, loc='upper center',
+              bbox_to_anchor=(0.5, -0.01), fontsize=7,
               frameon=True, fancybox=False, edgecolor='0.4',
-              handlelength=1.2, handleheight=0.9)
+              handlelength=1.2, handleheight=0.9, ncol=3)
 
     # ---- (d) Final soil mask (binary) ----
     ax = axes[1, 1]
@@ -632,9 +633,10 @@ def save_soil_mask_plot(soil_mask, ndvi, mndwi, output_folder):
         Patch(facecolor=(0.55, 0.37, 0.24), edgecolor='k', linewidth=0.4, label='Soil'),
         Patch(facecolor=(0.85, 0.85, 0.85), edgecolor='k', linewidth=0.4, label='Excluded'),
     ]
-    ax.legend(handles=legend_patches_d, loc='lower right', fontsize=7,
+    ax.legend(handles=legend_patches_d, loc='upper center',
+              bbox_to_anchor=(0.5, -0.01), fontsize=7,
               frameon=True, fancybox=False, edgecolor='0.4',
-              handlelength=1.2, handleheight=0.9)
+              handlelength=1.2, handleheight=0.9, ncol=2)
 
     out_path = diag_dir / "pre_classification_soil_mask.png"
     plt.savefig(out_path, dpi=300, bbox_inches='tight', facecolor='white')
