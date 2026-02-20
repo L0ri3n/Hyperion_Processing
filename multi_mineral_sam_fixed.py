@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import spectral as sp
 from scipy.interpolate import interp1d
-from scipy.ndimage import median_filter
+from scipy.ndimage import median_filter, label as nd_label
 from skimage.morphology import binary_opening, binary_closing, disk
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -40,6 +40,10 @@ SOIL_MASK_MORPH_RADIUS = 2
 SAVE_INDIVIDUAL_MAPS = True
 SAVE_COMPOSITE_MAP = True
 SHOW_PLOTS = False
+
+# Post-classification validation
+# Connected components with fewer pixels than this are flagged as noise.
+MIN_COMPONENT_SIZE = 4
 
 # =============================================================================
 # HELPERS
@@ -343,7 +347,12 @@ def main():
         print("\n9. Creating composite classification map...")
         create_composite_map(sam_angles_dict, match_scores_dict,
                            mineral_names, thresholds, soil_mask, OUTPUT_FOLDER)
-    
+
+    # Post-classification validation
+    print("\n10. Running post-classification validation...")
+    validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
+                         mineral_names, OUTPUT_FOLDER)
+
     print("\n" + "=" * 70)
     print("PROCESSING COMPLETE!")
     print("=" * 70)
@@ -957,6 +966,437 @@ def save_envi_classification(class_map, mineral_names, output_folder):
                        force=True)
     
     print(f"  ENVI format saved: classification_map.hdr/.img")
+
+
+# =============================================================================
+# POST-CLASSIFICATION VALIDATION
+# =============================================================================
+
+def _impute_nan_bands(spectra):
+    """Replace per-band NaN values in-place with that band's column mean.
+
+    If an entire band is NaN (e.g. a water-vapour band), the column is set
+    to 0 rather than propagating NaN into downstream computations.
+
+    Parameters
+    ----------
+    spectra : ndarray (n_pixels, n_bands), float64  – modified in place
+    """
+    nan_bands = np.where(np.any(np.isnan(spectra), axis=0))[0]
+    for b in nan_bands:
+        col = spectra[:, b]
+        mean_val = np.nanmean(col)
+        col[np.isnan(col)] = 0.0 if np.isnan(mean_val) else mean_val
+
+
+def _compute_morans_i(binary_mask, soil_r, soil_c,
+                      lps_weights, Moran):
+    """Compute Moran's I for *binary_mask* restricted to the soil domain.
+
+    Connectivity is Queen (8-neighbours) within the soil-pixel set; weights
+    are row-standardised.  Uses the normal-approximation z-score and p-value
+    (no permutations) for speed.
+
+    Parameters
+    ----------
+    binary_mask : (rows, cols) bool
+    soil_r, soil_c : 1-D int arrays – row/col indices of soil pixels
+    lps_weights : libpysal.weights module
+    Moran       : esda.Moran class
+
+    Returns
+    -------
+    I, z, p : float
+    sig_str : str  – human-readable significance description
+    """
+    import warnings
+
+    # Build a fast lookup: (row, col) -> index within soil-pixel array
+    idx_map = {(int(r), int(c)): i
+               for i, (r, c) in enumerate(zip(soil_r, soil_c))}
+
+    # Queen-contiguity neighbour dict restricted to soil pixels only
+    directions = [(-1, -1), (-1, 0), (-1, 1),
+                  (0,  -1),          (0,  1),
+                  (1,  -1), (1,  0), (1,  1)]
+    neighbors    = {}
+    weights_dict = {}
+    for i, (r, c) in enumerate(zip(soil_r.tolist(), soil_c.tolist())):
+        nbrs = [idx_map[(r + dr, c + dc)]
+                for dr, dc in directions
+                if (r + dr, c + dc) in idx_map]
+        neighbors[i]    = nbrs
+        weights_dict[i] = [1.0] * len(nbrs)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            w = lps_weights.W(neighbors, weights_dict, silence_warnings=True)
+        except TypeError:
+            w = lps_weights.W(neighbors, weights_dict)
+    w.transform = 'r'   # row-standardise
+
+    y = binary_mask[soil_r, soil_c].astype(np.float64)
+    if y.std() < 1e-12:
+        return np.nan, np.nan, np.nan, "N/A (constant mask)"
+
+    mi = Moran(y, w, permutations=0)
+    I, z, p = mi.I, mi.z_norm, mi.p_norm
+
+    if p < 0.05 and I > 0:
+        sig = "clustered (p<0.05)"
+    elif p < 0.05 and I < 0:
+        sig = "dispersed (p<0.05)"
+    else:
+        sig = f"random (p={p:.3f})"
+
+    return I, z, p, sig
+
+
+def _save_validation_figure(name, short, soil_mask,
+                             binary_mask, labeled, comp_sizes,
+                             noise_px_mask, n_components, noise_px_frac,
+                             n_noise_comps,
+                             hist, bin_edges, bin_centers,
+                             mean_a, std_a, skewness, dist_quality,
+                             thr, val_dir):
+    """Save a two-panel validation figure per mineral.
+
+    Left panel  – SAM angle histogram (30 bins, [0, threshold]) with mean
+                  and ±1σ markers.
+    Right panel – Labeled connected-component map coloured by log(size),
+                  with noise components overlaid in red.
+    """
+    fig, (ax_hist, ax_map) = plt.subplots(1, 2, figsize=(13, 5.5))
+
+    # ── Left: SAM angle histogram ─────────────────────────────────────────
+    bin_w_deg = np.degrees(bin_edges[1] - bin_edges[0])
+    ax_hist.bar(np.degrees(bin_centers), hist,
+                width=bin_w_deg * 0.88,
+                color='#3A7ABF', edgecolor='white', linewidth=0.3)
+    ax_hist.axvline(np.degrees(mean_a),
+                    color='#D62728', linestyle='--', linewidth=1.5,
+                    label=f'Mean = {np.degrees(mean_a):.2f}\u00b0')
+    for sign in (-1, 1):
+        ax_hist.axvline(np.degrees(mean_a + sign * std_a),
+                        color='#FF7F0E', linestyle=':', linewidth=1.2,
+                        label='\u00b11\u03c3' if sign == -1 else None)
+    ax_hist.set_xlabel('SAM Angle (\u00b0)', fontsize=11)
+    ax_hist.set_ylabel('Pixel Count', fontsize=11)
+    ax_hist.set_title(
+        f'{short} \u2014 SAM Angle Distribution\n'
+        f'Skewness = {skewness:.3f}  \u2022  {dist_quality}',
+        fontsize=10)
+    ax_hist.legend(fontsize=9)
+    ax_hist.grid(True, alpha=0.25)
+    ax_hist.set_xlim(0, np.degrees(thr))
+
+    # ── Right: component size map ─────────────────────────────────────────
+    # Base layer: white = nodata, light-gray = soil domain
+    base = np.ones((*binary_mask.shape, 3), dtype=np.float32)
+    base[soil_mask] = [0.88, 0.88, 0.88]
+    ax_map.imshow(base, interpolation='nearest')
+
+    # Component size in log scale for wide dynamic range
+    comp_size_map = np.zeros_like(binary_mask, dtype=np.float64)
+    for comp_id, size in enumerate(comp_sizes, start=1):
+        comp_size_map[labeled == comp_id] = float(size)
+
+    display = np.ma.masked_where(~binary_mask, np.log1p(comp_size_map))
+    max_log  = float(np.log1p(comp_sizes.max())) if len(comp_sizes) > 0 else 1.0
+    im = ax_map.imshow(display, cmap='viridis', interpolation='nearest',
+                       vmin=0, vmax=max_log)
+    cbar = plt.colorbar(im, ax=ax_map, fraction=0.046, pad=0.04)
+    cbar.set_label('log(1 + component size)  [px]', fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+
+    # Noise overlay (semi-transparent red)
+    if noise_px_mask.any():
+        noise_rgba = np.zeros((*binary_mask.shape, 4), dtype=np.float32)
+        noise_rgba[noise_px_mask] = [0.85, 0.10, 0.10, 0.70]
+        ax_map.imshow(noise_rgba, interpolation='nearest')
+
+    ax_map.set_title(
+        f'{short} \u2014 Connected Components  (n = {n_components})\n'
+        f'Noise (<{MIN_COMPONENT_SIZE} px): {n_noise_comps} comps, '
+        f'{noise_px_frac * 100:.1f}% of classified pixels',
+        fontsize=10)
+    ax_map.axis('off')
+
+    plt.tight_layout()
+    safe = name.replace(' ', '_').replace('(', '').replace(')', '')
+    fig_path = val_dir / f"{safe}_validation.png"
+    plt.savefig(fig_path, dpi=200, bbox_inches='tight', facecolor='white')
+    if not SHOW_PLOTS:
+        plt.close()
+
+
+def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
+                         mineral_names, output_folder):
+    """Post-classification validation of SAM results.
+
+    Four metrics are computed independently for each mineral class:
+
+    1. Connected-component stats
+       Labels the binary mask with scipy.ndimage.label and counts pixels per
+       component (np.bincount).  Components with fewer than MIN_COMPONENT_SIZE
+       pixels are flagged as probable noise.
+       Reports: n_components, n_noise_comps, noise_px_frac.
+
+    2. SAM angle distribution
+       Extracts spectral-angle values at classified pixel locations from the
+       rule image and builds a 30-bin histogram over [0, threshold_angle].
+       Reports: mean_angle, std_angle, skewness (left-skewed toward zero =
+       good signal; flat/right-skewed = noisy classification).
+
+    3. Inertia vs. null model  (requires scikit-learn)
+       Fits KMeans(n_clusters=1) to the classified pixels' spectral vectors
+       from the reflectance cube (NaN-aware) and to the same number of random
+       non-classified soil pixels.
+       Reports: inertia_real, inertia_null, ratio.  Ratio << 1 means the
+       classified pixels are spectrally more coherent than random soil.
+
+    4. Moran's I  (requires esda + libpysal)
+       Builds Queen-contiguity spatial weights within the soil-mask domain and
+       computes Moran's I on the binary mask.
+       Reports: I, z-score, p-value.  Significant positive I (p < 0.05)
+       supports spatially structured detections.
+
+    Parameters
+    ----------
+    sam_angles_dict : dict  {mineral_name -> (rows, cols) ndarray}
+        SAM rule images; non-soil pixels set to pi.
+    thresholds : dict  {mineral_name -> float}
+        Per-mineral SAM angle thresholds (radians).
+    soil_mask : ndarray (rows, cols), bool
+        True for soil pixels eligible for SAM classification.
+    cube : ndarray (rows, cols, bands), float32
+        Reflectance cube (0-1 scale); may contain NaN in bad bands.
+    mineral_names : list of str
+        Ordered mineral names matching sam_angles_dict keys.
+    output_folder : str or Path
+        Root output folder; figures and CSV go to <output_folder>/validation/.
+    """
+    # ── optional dependencies ─────────────────────────────────────────────
+    try:
+        from sklearn.cluster import KMeans
+        HAS_SKLEARN = True
+    except ImportError:
+        HAS_SKLEARN = False
+        print("  [validation] WARNING: scikit-learn not found — "
+              "inertia metric skipped.")
+
+    try:
+        import libpysal.weights as lps_weights
+        from esda import Moran
+        HAS_ESDA = True
+    except ImportError:
+        HAS_ESDA = False
+        print("  [validation] WARNING: esda/libpysal not found — "
+              "Moran's I skipped.")
+
+    val_dir = Path(output_folder) / "validation"
+    val_dir.mkdir(parents=True, exist_ok=True)
+
+    np.random.seed(42)
+
+    # Pre-compute soil-pixel row/col arrays once (reused for Moran's I)
+    soil_r, soil_c = np.where(soil_mask)
+
+    summary_rows = []
+
+    print("\n" + "=" * 70)
+    print("POST-CLASSIFICATION VALIDATION")
+    print("=" * 70)
+
+    for name in mineral_names:
+        short      = short_mineral_name(name)
+        thr        = thresholds[name]
+        sam_angles = sam_angles_dict[name]
+
+        # Binary mask: classified AND within soil domain
+        binary_mask  = (sam_angles < thr) & soil_mask
+        n_classified = int(binary_mask.sum())
+
+        print(f"\n  \u2500\u2500 {short} \u2500\u2500 ({n_classified} classified pixels)")
+        row = {"Mineral": short, "Pixels": n_classified}
+
+        if n_classified == 0:
+            print("     No classified pixels \u2014 all metrics skipped.")
+            row.update({
+                "Components": 0, "Noise_comps": 0, "Noise_px_frac": np.nan,
+                "Mean_angle_deg": np.nan, "Std_angle_deg": np.nan,
+                "Skewness": np.nan, "Dist_quality": "N/A",
+                "Inertia_real": np.nan, "Inertia_null": np.nan,
+                "Inertia_ratio": np.nan,
+                "Morans_I": np.nan, "Morans_z": np.nan,
+                "Morans_p": np.nan, "Morans_sig": "N/A",
+            })
+            summary_rows.append(row)
+            continue
+
+        # ── 1. Connected-component statistics ─────────────────────────────
+        labeled, n_components = nd_label(binary_mask)
+        # Component pixel counts; bincount index 0 = background, skip it
+        comp_sizes    = np.bincount(labeled.ravel())[1:]
+        noise_ids     = np.where(comp_sizes < MIN_COMPONENT_SIZE)[0] + 1
+        n_noise_comps = int(len(noise_ids))
+        n_noise_px    = int(comp_sizes[comp_sizes < MIN_COMPONENT_SIZE].sum())
+        noise_px_frac = n_noise_px / n_classified
+        noise_px_mask = np.isin(labeled, noise_ids)
+
+        print(f"     [1] Connected components: {n_components} total")
+        print(f"         Noise (<{MIN_COMPONENT_SIZE} px): "
+              f"{n_noise_comps} comps, {n_noise_px} px "
+              f"({noise_px_frac * 100:.1f}% of classified pixels)")
+
+        row.update({
+            "Components":    n_components,
+            "Noise_comps":   n_noise_comps,
+            "Noise_px_frac": round(noise_px_frac, 4),
+        })
+
+        # ── 2. SAM angle distribution ─────────────────────────────────────
+        angles_cls = sam_angles[binary_mask]   # all in [0, thr)
+        hist, bin_edges = np.histogram(angles_cls, bins=30, range=(0.0, thr))
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+        mean_a = float(np.mean(angles_cls))
+        std_a  = float(np.std(angles_cls))
+        skewness = (float(np.mean(((angles_cls - mean_a) / std_a) ** 3))
+                    if std_a > 1e-12 else 0.0)
+
+        if skewness < -0.3:
+            dist_quality = "left-skewed \u2192 good signal"
+        elif skewness > 0.3:
+            dist_quality = "right-skewed \u2192 noisy"
+        else:
+            dist_quality = "symmetric"
+
+        print(f"     [2] SAM angle distribution:")
+        print(f"         Mean = {np.degrees(mean_a):.2f}\u00b0,  "
+              f"Std = {np.degrees(std_a):.2f}\u00b0,  "
+              f"Skewness = {skewness:.3f}  ({dist_quality})")
+
+        row.update({
+            "Mean_angle_deg": round(np.degrees(mean_a), 3),
+            "Std_angle_deg":  round(np.degrees(std_a),  3),
+            "Skewness":       round(skewness, 4),
+            "Dist_quality":   dist_quality,
+        })
+
+        # ── 3. KMeans inertia vs null model ──────────────────────────────
+        inertia_real = inertia_null = inertia_ratio = np.nan
+
+        if HAS_SKLEARN and n_classified >= 2:
+            r_idx, c_idx = np.where(binary_mask)
+            spectra_real = cube[r_idx, c_idx, :].astype(np.float64)
+            _impute_nan_bands(spectra_real)
+
+            km = KMeans(n_clusters=1, n_init=1, random_state=42)
+            km.fit(spectra_real)
+            inertia_real = km.inertia_
+
+            # Null: same-sized random sample from non-classified soil pixels
+            non_cls_r, non_cls_c = np.where(soil_mask & ~binary_mask)
+            n_null = min(n_classified, len(non_cls_r))
+
+            if n_null >= 2:
+                idx_s        = np.random.choice(len(non_cls_r),
+                                                size=n_null, replace=False)
+                spectra_null = cube[non_cls_r[idx_s],
+                                    non_cls_c[idx_s], :].astype(np.float64)
+                _impute_nan_bands(spectra_null)
+
+                km_null = KMeans(n_clusters=1, n_init=1, random_state=42)
+                km_null.fit(spectra_null)
+                inertia_null  = km_null.inertia_
+                inertia_ratio = (inertia_real / inertia_null
+                                 if inertia_null > 0 else np.nan)
+
+        if not np.isnan(inertia_ratio):
+            coherence = ("spectrally coherent vs. soil"
+                         if inertia_ratio < 1.0 else "not more coherent than soil")
+            print(f"     [3] Inertia  real = {inertia_real:.2f},  "
+                  f"null = {inertia_null:.2f},  "
+                  f"ratio = {inertia_ratio:.4f}  ({coherence})")
+        elif HAS_SKLEARN:
+            print(f"     [3] Inertia: insufficient null pixels.")
+        else:
+            print(f"     [3] Inertia: skipped (scikit-learn unavailable).")
+
+        row.update({
+            "Inertia_real":  (round(inertia_real,  2)
+                              if not np.isnan(inertia_real)  else np.nan),
+            "Inertia_null":  (round(inertia_null,  2)
+                              if not np.isnan(inertia_null)  else np.nan),
+            "Inertia_ratio": (round(inertia_ratio, 4)
+                              if not np.isnan(inertia_ratio) else np.nan),
+        })
+
+        # ── 4. Moran's I spatial autocorrelation ─────────────────────────
+        moran_I = moran_z = moran_p = np.nan
+        moran_sig = "N/A"
+
+        if HAS_ESDA and len(soil_r) >= 4:
+            try:
+                moran_I, moran_z, moran_p, moran_sig = _compute_morans_i(
+                    binary_mask, soil_r, soil_c,
+                    lps_weights, Moran)
+                print(f"     [4] Moran's I = {moran_I:.4f},  "
+                      f"z = {moran_z:.2f},  p = {moran_p:.4f}"
+                      f"  ({moran_sig})")
+            except Exception as exc:
+                print(f"     [4] Moran's I: failed ({exc})")
+        elif not HAS_ESDA:
+            print("     [4] Moran's I: skipped (esda/libpysal unavailable).")
+        else:
+            print("     [4] Moran's I: insufficient soil pixels.")
+
+        row.update({
+            "Morans_I":   (round(moran_I,   4)
+                           if not np.isnan(moran_I)   else np.nan),
+            "Morans_z":   (round(moran_z,   4)
+                           if not np.isnan(moran_z)   else np.nan),
+            "Morans_p":   (round(moran_p,   4)
+                           if not np.isnan(moran_p)   else np.nan),
+            "Morans_sig": moran_sig,
+        })
+
+        summary_rows.append(row)
+
+        # ── Validation figure ─────────────────────────────────────────────
+        _save_validation_figure(
+            name, short, soil_mask,
+            binary_mask, labeled, comp_sizes,
+            noise_px_mask, n_components, noise_px_frac, n_noise_comps,
+            hist, bin_edges, bin_centers,
+            mean_a, std_a, skewness, dist_quality,
+            thr, val_dir,
+        )
+        safe = name.replace(' ', '_').replace('(', '').replace(')', '')
+        print(f"     Figure saved: {safe}_validation.png")
+
+    # ── Summary table ─────────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print("VALIDATION SUMMARY")
+    print("=" * 70)
+
+    if summary_rows:
+        df = pd.DataFrame(summary_rows)
+        display_cols = [
+            "Mineral", "Pixels", "Components", "Noise_px_frac",
+            "Mean_angle_deg", "Std_angle_deg", "Skewness",
+            "Inertia_ratio", "Morans_I", "Morans_p", "Morans_sig",
+        ]
+        display_cols = [c for c in display_cols if c in df.columns]
+        print(df[display_cols].to_string(index=False))
+
+        csv_path = val_dir / "validation_summary.csv"
+        df.to_csv(csv_path, index=False)
+        print(f"\n  Full table saved: {csv_path}")
+
+    print("=" * 70)
 
 
 if __name__ == "__main__":
