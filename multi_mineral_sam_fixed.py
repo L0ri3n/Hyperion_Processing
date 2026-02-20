@@ -70,13 +70,13 @@ def short_mineral_name(full_name):
 # Maximally distinct palette for up to 10 mineral classes.
 # Based on Tableau-10 / colorbrewer qualitative schemes.
 MINERAL_COLORS = [
-    '#E66101',  # orange        – Alunite
-    '#5E3C99',  # purple        – Goethite
-    '#D62728',  # red           – Hematite
-    '#1F77B4',  # blue          – Jarosite (Na)
-    '#17BECF',  # cyan          – Jarosite (K)
-    '#BCBD22',  # yellow-green  – Pyrite
-    '#2CA02C',  # green         – Schwertmannite
+    '#BCBD22',  # yellow-green  – Goethite
+    '#5E3C99',  # purple        – Hematite
+    '#D62728',  # red           – Jarosite (Na)
+    '#2CA02C',  # green         – Jarosite (K)
+    '#17BECF',  # cyan          – Schwertmannite
+    '#E66101',  # orange        (spare)
+    '#1F77B4',  # blue          (spare)
     '#E7298A',  # magenta       (spare)
     '#A6761D',  # brown         (spare)
     '#666666',  # grey          (spare)
