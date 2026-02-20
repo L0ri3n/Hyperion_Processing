@@ -29,7 +29,7 @@ SAM_THRESHOLD_MARGIN = 0.01
 
 # Pre-classification: index-based soil masking
 # Pixels with NDVI >= this value are considered vegetation and excluded
-NDVI_THRESHOLD = 0.40
+NDVI_THRESHOLD = 0.50
 # Pixels with MNDWI >= this value are considered water and excluded
 MNDWI_THRESHOLD = 0.0
 # Median filter kernel size (pixels) for cleaning the soil mask
