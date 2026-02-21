@@ -122,14 +122,6 @@ SAVE_COMPOSITE_MAP = True     # Save composite classification map
 SHOW_PLOTS = False            # Set True to display plots interactively
 ```
 
-### Output Control
-
-```python
-SAVE_INDIVIDUAL_MAPS = True   # Save PNG for each mineral
-SAVE_COMPOSITE_MAP = True     # Save composite classification map
-SHOW_PLOTS = False            # Set True to display plots interactively
-```
-
 ### Parallel Processing (parallel version only)
 
 ```python
@@ -163,6 +155,30 @@ After running, your `OUTPUT_FOLDER` will contain:
   - Number of pixels
   - Percentage of image
 
+### 4. Validation (`validation/` subfolder)
+- `<mineral>_validation.png` — two-panel figure per mineral:
+  - **Left:** SAM angle histogram with overlapping null/background distribution
+  - **Right:** connected-component map coloured by log(component size), noise in red
+- `validation_summary.csv` — one row per mineral with all four validation metrics:
+
+| Column | Description |
+|---|---|
+| `Pixels` | Classified pixel count (adaptive threshold) |
+| `Null_thr_deg` | Null-model threshold angle (degrees) |
+| `Null_pixels` | Pixel count under null-model threshold |
+| `Components` | Number of connected components |
+| `Noise_px_frac` | Fraction of classified pixels in noise components (< `MIN_COMPONENT_SIZE` px) |
+| `Mean_angle_deg` | Mean SAM angle of classified pixels (degrees) |
+| `Std_angle_deg` | Standard deviation of classified SAM angles (degrees) |
+| `Skewness` | Skewness of the classified angle distribution (negative = good signal) |
+| `Mean_angle_cls_deg` | Mean α_classified — mean angle of classified pixels to endmember |
+| `Mean_angle_null_deg` | Mean α_null — mean angle of background pixels to same endmember |
+| `Angular_inertia_ratio` | `mean(α_cls) / mean(α_null)` — **< 1 = good** |
+| `MannWhitney_p` | One-sided Mann-Whitney p-value (H₁: α_cls < α_null) |
+| `Effect_size` | Rank-biserial r — **> 0 = classified more similar to endmember than background** |
+| `Morans_I` | Moran's I spatial autocorrelation (Queen contiguity, soil domain) |
+| `Morans_p` | Moran's I p-value (< 0.05 + positive I = spatially clustered detections) |
+
 ---
 
 ## Understanding the Results
@@ -184,6 +200,59 @@ Shows the **dominant mineral** at each pixel based on:
 1. Which mineral has the highest match score
 2. Only if that score > 0.5
 3. Otherwise, pixel is "Unclassified"
+
+### Post-Classification Validation Metrics
+
+`validate_sam_results` (step 10) runs four independent checks per mineral:
+
+#### Metric 1 — Connected Components
+Labels the binary mask and counts component sizes.  Small isolated components
+(< `MIN_COMPONENT_SIZE` pixels, default 4) are flagged as probable noise.
+High `Noise_px_frac` values suggest the classification is scattered rather
+than spatially coherent.
+
+#### Metric 2 — SAM Angle Distribution
+Builds a 30-bin histogram of classified-pixel angles over `[0, threshold]`
+and computes mean, standard deviation, and skewness.
+
+- Left-skewed distribution (skewness < −0.3) → most pixels cluster near angle
+  zero, indicating confident matches.
+- Flat or right-skewed → pixels are spread across the threshold window,
+  suggesting marginal matches.
+
+#### Metric 3 — Angular Spectral Inertia
+Compares the SAM angle distributions of classified pixels (α_classified) and
+a random background soil sample (α_null) against the **same endmember**.
+
+```
+Angular_inertia_ratio = mean(α_classified) / mean(α_null)
+```
+
+Because SAM is magnitude-invariant, this comparison is performed entirely in
+angle space — consistent with how the classification was made.
+
+| Angular_inertia_ratio | Interpretation |
+|---|---|
+| < 1.0 | Classified pixels are on average more similar to the endmember than random background soil — supports the classification |
+| ≥ 1.0 | Classified pixels are no more similar to the endmember than background — classification is not distinguishable from chance |
+
+The **Mann-Whitney U test** (one-sided, H₁: α_cls < α_null) provides a
+p-value for this separation, and the **rank-biserial effect size r** quantifies
+its magnitude:
+
+- `r > 0` → classified pixels tend to have lower angles than background (good)
+- `r ≈ 0` → no separation
+- `r < 0` → classified pixels have *higher* angles than background (failure)
+
+Background pixels are all soil pixels not classified by **any** mineral, giving
+a clean unclassified baseline.  The null sample size is at least
+`max(n_classified, NULL_SAMPLE_SIZE)` to ensure the test has sufficient power.
+
+#### Metric 4 — Moran's I Spatial Autocorrelation
+Tests whether the binary classification mask is spatially clustered within the
+soil domain (Queen contiguity).  Significant positive Moran's I (p < 0.05)
+indicates the detections form spatially coherent patches rather than being
+randomly scattered — supporting geological plausibility.
 
 ---
 

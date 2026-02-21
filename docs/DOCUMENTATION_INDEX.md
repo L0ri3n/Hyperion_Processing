@@ -2,7 +2,7 @@
 ## Hyperion AMD Mineral Mapping Project
 
 **Repository:** PROCESSING_AND_POST
-**Last Updated:** January 13, 2026
+**Last Updated:** February 2026
 **Project:** Remote Sensing - AMD Mineral Detection using Hyperion Hyperspectral Imagery
 
 ---
@@ -243,6 +243,44 @@ background-anchored statistical threshold that has a clear probabilistic interpr
 
 ---
 
+### [ANGULAR_INERTIA_VALIDATION.md](changelogs/ANGULAR_INERTIA_VALIDATION.md)
+**Date:** February 2026
+**Feature:** Replacement of Euclidean KMeans inertia (metric 3 in `validate_sam_results`)
+with an angular spectral inertia approach consistent with SAM's magnitude-invariant nature
+
+**Summary:**
+- **Problem:** The previous metric 3 used KMeans inertia (Euclidean distances in
+  reflectance space) to measure the coherence of classified pixels. KMeans inertia
+  penalises brightness variation that SAM explicitly ignores, making it inconsistent
+  with the classifier being validated.
+- **Solution:** For each mineral, the distribution of SAM angles at classified pixel
+  locations (α_classified) is compared against SAM angles computed between a random
+  background soil sample and the same endmember (α_null). If the classification is
+  valid, α_classified should be stochastically lower than α_null.
+- **Statistics reported:**
+  - `Mean_angle_cls_deg` / `Mean_angle_null_deg` — mean angles of each distribution
+  - `Angular_inertia_ratio` = mean(α_cls) / mean(α_null) — **< 1 = good signal**
+  - `MannWhitney_p` — one-sided Mann-Whitney U p-value (H₁: α_cls < α_null)
+  - `Effect_size` — rank-biserial r (> 0 = classified more similar to endmember than background)
+- **Background pool:** shared across all minerals; excludes all pixels classified by
+  any mineral. Pool size = max(n_classified_max, NULL_SAMPLE_SIZE), capped at
+  available background pixels.
+- **CSV change:** `Inertia_real`, `Inertia_null`, `Inertia_ratio` replaced by
+  `Mean_angle_cls_deg`, `Mean_angle_null_deg`, `Angular_inertia_ratio`,
+  `MannWhitney_p`, `Effect_size`. All other columns unchanged.
+- **Figure change:** The gray histogram overlay in validation figures now shows the
+  angular inertia null distribution (background angles to same endmember) rather
+  than the `derive_null_thresholds` sample.
+- **Scope:** Only `validate_sam_results` (step 10). The `compare_thresholds` table
+  (step 9b) retains its own local KMeans inertia — that comparison is a separate
+  diagnostic and is not affected.
+
+**Key Achievement:** All four validation metrics now operate entirely in angle space,
+making the post-classification quality assessment fully consistent with SAM's
+magnitude-invariant design principle.
+
+---
+
 ### [SAM_OUTPUT_FIX_SUMMARY.md](changelogs/SAM_OUTPUT_FIX_SUMMARY.md)
 **Date:** SAM output SNAP compatibility
 **Issue:** `java.io.EOFException` when opening SAM classifications in SNAP
@@ -309,14 +347,15 @@ background-anchored statistical threshold that has a clear probabilistic interpr
   - Visual diagrams and flowcharts
 
 ### Changelogs
-- **Total:** 5 documents
-- **Issues Resolved / Features Added:** 5 major items
+- **Total:** 6 documents
+- **Issues Resolved / Features Added:** 6 major items
 - **Coverage:**
   - SAM classification debugging
   - USGS library integration
   - ENVI format compatibility
   - SNAP software compatibility
   - Null-model statistical thresholding
+  - Angular spectral inertia validation metric
 
 ---
 
@@ -346,6 +385,7 @@ Map acid mine drainage (AMD) minerals in the Rio Tinto area using Hyperion hyper
 - ✅ SAM implementation debugged
 - ✅ SNAP compatibility fixed
 - ✅ Null-model statistical thresholding implemented
+- ✅ Angular spectral inertia validation metric implemented
 - 🔄 Ready for full workflow execution
 - 🔄 Awaiting Hyperion image cube
 
@@ -368,7 +408,9 @@ docs/
     ├── SAM_Implementation_Report.md
     ├── INTEGRATION_SUMMARY.md
     ├── ENDMEMBER_FIX_SUMMARY.md
-    └── SAM_OUTPUT_FIX_SUMMARY.md
+    ├── SAM_OUTPUT_FIX_SUMMARY.md
+    ├── NULL_MODEL_THRESHOLD.md
+    └── ANGULAR_INERTIA_VALIDATION.md
 ```
 
 ---
@@ -384,6 +426,14 @@ docs/
 ---
 
 ## Version History
+
+- **v1.2** (2026-02-21): Angular spectral inertia validation metric
+  - Added `ANGULAR_INERTIA_VALIDATION.md` changelog
+  - Updated `README_SAM_MultiMineral.md` — added full "Post-Classification
+    Validation Metrics" section covering all four metrics; added validation
+    subsection and column table to "Output Files"
+  - Updated `docs/README.md` — new changelog entry in folder tree and What's What
+  - Updated `DOCUMENTATION_INDEX.md` — new index entry, project status, document counts, file tree
 
 - **v1.1** (2026-02-21): Null-model threshold documentation
   - Added `NULL_MODEL_THRESHOLD.md` changelog

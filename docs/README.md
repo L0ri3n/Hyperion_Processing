@@ -18,12 +18,13 @@ docs/
 │   ├── WORKFLOW_DIAGRAM.md           - Visual flowcharts
 │   └── SETUP_AND_USAGE_GUIDE.md      - Setup instructions
 │
-└── changelogs/                    (5 documents)
-    ├── SAM_Implementation_Report.md   - SAM debugging
-    ├── INTEGRATION_SUMMARY.md         - USGS library integration
-    ├── ENDMEMBER_FIX_SUMMARY.md       - SNAP library compatibility
-    ├── SAM_OUTPUT_FIX_SUMMARY.md      - SNAP output compatibility
-    └── NULL_MODEL_THRESHOLD.md        - Statistical null-model thresholding
+└── changelogs/                    (6 documents)
+    ├── SAM_Implementation_Report.md      - SAM debugging
+    ├── INTEGRATION_SUMMARY.md            - USGS library integration
+    ├── ENDMEMBER_FIX_SUMMARY.md          - SNAP library compatibility
+    ├── SAM_OUTPUT_FIX_SUMMARY.md         - SNAP output compatibility
+    ├── NULL_MODEL_THRESHOLD.md           - Statistical null-model thresholding
+    └── ANGULAR_INERTIA_VALIDATION.md     - Angular spectral inertia validation metric
 ```
 
 ## What's What
@@ -43,6 +44,7 @@ Technical documentation of fixes and improvements:
 - **Endmember Fix:** Making library SNAP-compatible
 - **SAM Output Fix:** Making classification results SNAP-compatible
 - **Null-Model Threshold:** Replacing the arbitrary min-angle threshold with a background-anchored statistical threshold
+- **Angular Inertia Validation:** Replacing the Euclidean inertia metric with an angle-space comparison consistent with SAM
 
 ## For Different Users
 
@@ -73,4 +75,4 @@ Technical documentation of fixes and improvements:
 
 ---
 
-*Last updated: January 13, 2026*
+*Last updated: February 2026*

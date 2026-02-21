@@ -8,6 +8,7 @@ import pandas as pd
 import spectral as sp
 from scipy.interpolate import interp1d
 from scipy.ndimage import median_filter, label as nd_label
+from scipy.stats import mannwhitneyu
 from skimage.morphology import binary_opening, binary_closing, disk
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -614,7 +615,8 @@ def main():
     validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
                          mineral_names, OUTPUT_FOLDER,
                          null_thresholds=null_thresholds,
-                         null_distributions=null_distributions)
+                         null_distributions=null_distributions,
+                         mineral_spectra=mineral_spectra)
 
     print("\n" + "=" * 70)
     print("PROCESSING COMPLETE!")
@@ -1429,7 +1431,8 @@ def _save_validation_figure(name, short, soil_mask,
 
 def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
                          mineral_names, output_folder,
-                         null_thresholds=None, null_distributions=None):
+                         null_thresholds=None, null_distributions=None,
+                         mineral_spectra=None):
     """Post-classification validation of SAM results.
 
     Four metrics are computed independently for each mineral class:
@@ -1446,12 +1449,18 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
        Reports: mean_angle, std_angle, skewness (left-skewed toward zero =
        good signal; flat/right-skewed = noisy classification).
 
-    3. Inertia vs. null model  (requires scikit-learn)
-       Fits KMeans(n_clusters=1) to the classified pixels' spectral vectors
-       from the reflectance cube (NaN-aware) and to the same number of random
-       non-classified soil pixels.
-       Reports: inertia_real, inertia_null, ratio.  Ratio << 1 means the
-       classified pixels are spectrally more coherent than random soil.
+    3. Angular spectral inertia
+       Compares the distribution of per-pixel SAM angles at classified
+       locations (α_classified) against angles computed between a random
+       background soil sample and the same endmember (α_null).
+       Background pixels exclude ALL pixels classified by ANY mineral.
+       Sample size is max(n_classified, NULL_SAMPLE_SIZE), capped at the
+       number of available background pixels.
+       Reports: mean_angle_cls_deg, mean_angle_null_deg,
+       angular_inertia_ratio (mean_cls/mean_null; < 1 → good signal),
+       mannwhitney_p (one-sided H1: classified angles < null), and
+       effect_size r (rank-biserial; > 0 → classified more similar to
+       endmember than background).
 
     4. Moran's I  (requires esda + libpysal)
        Builds Queen-contiguity spatial weights within the soil-mask domain and
@@ -1473,16 +1482,11 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
         Ordered mineral names matching sam_angles_dict keys.
     output_folder : str or Path
         Root output folder; figures and CSV go to <output_folder>/validation/.
+    mineral_spectra : dict {name -> (bands,) ndarray}, optional
+        Unit-normalised endmember spectra; required for the angular inertia
+        metric.  Passed from main() as the mineral_spectra dict.
     """
     # ── optional dependencies ─────────────────────────────────────────────
-    try:
-        from sklearn.cluster import KMeans
-        HAS_SKLEARN = True
-    except ImportError:
-        HAS_SKLEARN = False
-        print("  [validation] WARNING: scikit-learn not found — "
-              "inertia metric skipped.")
-
     try:
         import libpysal.weights as lps_weights
         from esda import Moran
@@ -1492,6 +1496,11 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
         print("  [validation] WARNING: esda/libpysal not found — "
               "Moran's I skipped.")
 
+    HAS_SPECTRA = mineral_spectra is not None
+    if not HAS_SPECTRA:
+        print("  [validation] WARNING: mineral_spectra not provided — "
+              "angular inertia metric skipped.")
+
     val_dir = Path(output_folder) / "validation"
     val_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1499,6 +1508,44 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
 
     # Pre-compute soil-pixel row/col arrays once (reused for Moran's I)
     soil_r, soil_c = np.where(soil_mask)
+
+    # ── angular inertia: build shared background pool ─────────────────────
+    # Background = soil pixels NOT classified by ANY mineral under its
+    # adaptive threshold.  Extracted once; per-mineral dot products computed
+    # inside the loop against each endmember.
+    _ai_bg_spectra = None   # (pool_sz, bands) float64  — None if unavailable
+    _ai_bg_norms   = None   # (pool_sz,)        float64
+
+    if HAS_SPECTRA:
+        _classified_any_ai = np.zeros(soil_mask.shape, dtype=bool)
+        for _nm in mineral_names:
+            _classified_any_ai |= (sam_angles_dict[_nm] < thresholds[_nm]) & soil_mask
+
+        _bg_r_ai, _bg_c_ai = np.where(soil_mask & ~_classified_any_ai)
+        _n_bg_ai = len(_bg_r_ai)
+
+        if _n_bg_ai >= 2:
+            # Pool size: at least NULL_SAMPLE_SIZE or the largest per-mineral
+            # classified count, capped at available background pixels so that
+            # the null sample always matches or exceeds n_classified.
+            _n_cls_per = {
+                _nm: int(((sam_angles_dict[_nm] < thresholds[_nm]) & soil_mask).sum())
+                for _nm in mineral_names
+            }
+            _n_max_cls  = max(_n_cls_per.values(), default=0)
+            _pool_sz    = min(max(_n_max_cls, NULL_SAMPLE_SIZE), _n_bg_ai)
+            np.random.seed(42)
+            _pool_idx   = np.random.choice(_n_bg_ai, size=_pool_sz, replace=False)
+            _ai_bg_spectra = cube[_bg_r_ai[_pool_idx],
+                                  _bg_c_ai[_pool_idx], :].astype(np.float64)
+            _impute_nan_bands(_ai_bg_spectra)
+            _ai_bg_norms = np.linalg.norm(_ai_bg_spectra, axis=1)
+            _ai_bg_norms = np.where(_ai_bg_norms == 0, 1e-10, _ai_bg_norms)
+            print(f"  Angular inertia background pool: "
+                  f"{_n_bg_ai:,} pixels available, {_pool_sz:,} sampled")
+        else:
+            print("  [validation] Angular inertia: fewer than 2 background "
+                  "pixels available — metric skipped.")
 
     summary_rows = []
 
@@ -1542,8 +1589,9 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
                 "Components": 0, "Noise_comps": 0, "Noise_px_frac": np.nan,
                 "Mean_angle_deg": np.nan, "Std_angle_deg": np.nan,
                 "Skewness": np.nan, "Dist_quality": "N/A",
-                "Inertia_real": np.nan, "Inertia_null": np.nan,
-                "Inertia_ratio": np.nan,
+                "Mean_angle_cls_deg": np.nan, "Mean_angle_null_deg": np.nan,
+                "Angular_inertia_ratio": np.nan,
+                "MannWhitney_p": np.nan, "Effect_size": np.nan,
                 "Morans_I": np.nan, "Morans_z": np.nan,
                 "Morans_p": np.nan, "Morans_sig": "N/A",
             })
@@ -1600,53 +1648,65 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
             "Dist_quality":   dist_quality,
         })
 
-        # ── 3. KMeans inertia vs null model ──────────────────────────────
-        inertia_real = inertia_null = inertia_ratio = np.nan
+        # ── 3. Angular spectral inertia ───────────────────────────────────
+        # Compare α_classified (SAM angles at classified pixels) against
+        # α_null (SAM angles of random background soil vs same endmember).
+        # Ratio = mean(α_cls) / mean(α_null): < 1 → classified pixels are
+        # on average more similar to the endmember than background soil.
+        # Mann-Whitney U (one-sided, H1: α_cls < α_null) quantifies whether
+        # this separation is statistically significant.
+        # Effect size r = 1 − 2U/(n1·n2): +1 → classified << null (good).
+        mean_cls_deg = mean_null_deg = ang_ratio = mwu_p = effect_r = np.nan
+        _angles_null_ai = None
 
-        if HAS_SKLEARN and n_classified >= 2:
-            r_idx, c_idx = np.where(binary_mask)
-            spectra_real = cube[r_idx, c_idx, :].astype(np.float64)
-            _impute_nan_bands(spectra_real)
+        if _ai_bg_spectra is not None and n_classified >= 2:
+            endmember = mineral_spectra[name]          # unit-normalised
+            _cos_null  = (_ai_bg_spectra @ endmember) / _ai_bg_norms
+            _cos_null  = np.clip(_cos_null, -1.0, 1.0)
+            _angles_null_ai = np.arccos(_cos_null)
 
-            km = KMeans(n_clusters=1, n_init=1, random_state=42)
-            km.fit(spectra_real)
-            inertia_real = km.inertia_
+            _mean_cls_rad  = float(np.mean(angles_cls))
+            _mean_null_rad = float(np.mean(_angles_null_ai))
+            mean_cls_deg   = float(np.degrees(_mean_cls_rad))
+            mean_null_deg  = float(np.degrees(_mean_null_rad))
+            ang_ratio      = (_mean_cls_rad / _mean_null_rad
+                              if _mean_null_rad > 0 else np.nan)
 
-            # Null: same-sized random sample from non-classified soil pixels
-            non_cls_r, non_cls_c = np.where(soil_mask & ~binary_mask)
-            n_null = min(n_classified, len(non_cls_r))
+            # One-sided Mann-Whitney: H1 = classified angles stochastically
+            # less than null angles.  U counts (cls_i < null_j) pairs.
+            # Small U → large p; large U → small p (supports H1).
+            _U, mwu_p = mannwhitneyu(angles_cls, _angles_null_ai,
+                                     alternative='less')
+            n1, n2   = len(angles_cls), len(_angles_null_ai)
+            # Rank-biserial r: +1 = all classified < all null (perfect)
+            #                   0 = no difference
+            #                  -1 = all classified > all null (inverted)
+            effect_r = 1.0 - (2.0 * _U) / (n1 * n2)
 
-            if n_null >= 2:
-                idx_s        = np.random.choice(len(non_cls_r),
-                                                size=n_null, replace=False)
-                spectra_null = cube[non_cls_r[idx_s],
-                                    non_cls_c[idx_s], :].astype(np.float64)
-                _impute_nan_bands(spectra_null)
-
-                km_null = KMeans(n_clusters=1, n_init=1, random_state=42)
-                km_null.fit(spectra_null)
-                inertia_null  = km_null.inertia_
-                inertia_ratio = (inertia_real / inertia_null
-                                 if inertia_null > 0 else np.nan)
-
-        if not np.isnan(inertia_ratio):
-            coherence = ("spectrally coherent vs. soil"
-                         if inertia_ratio < 1.0 else "not more coherent than soil")
-            print(f"     [3] Inertia  real = {inertia_real:.2f},  "
-                  f"null = {inertia_null:.2f},  "
-                  f"ratio = {inertia_ratio:.4f}  ({coherence})")
-        elif HAS_SKLEARN:
-            print(f"     [3] Inertia: insufficient null pixels.")
+            _coherence = "< null (good)" if ang_ratio < 1.0 else ">= null (poor)"
+            print(f"     [3] Angular inertia:")
+            print(f"         mean(classified) = {mean_cls_deg:.3f}\u00b0,  "
+                  f"mean(null) = {mean_null_deg:.3f}\u00b0,  "
+                  f"ratio = {ang_ratio:.4f}  ({_coherence})")
+            print(f"         Mann-Whitney p = {mwu_p:.4e},  "
+                  f"effect size r = {effect_r:.4f}")
+        elif _ai_bg_spectra is not None:
+            print("     [3] Angular inertia: < 2 classified pixels — skipped.")
         else:
-            print(f"     [3] Inertia: skipped (scikit-learn unavailable).")
+            print("     [3] Angular inertia: skipped "
+                  "(mineral_spectra not provided or no background pixels).")
 
         row.update({
-            "Inertia_real":  (round(inertia_real,  2)
-                              if not np.isnan(inertia_real)  else np.nan),
-            "Inertia_null":  (round(inertia_null,  2)
-                              if not np.isnan(inertia_null)  else np.nan),
-            "Inertia_ratio": (round(inertia_ratio, 4)
-                              if not np.isnan(inertia_ratio) else np.nan),
+            "Mean_angle_cls_deg":    (round(mean_cls_deg,  3)
+                                      if not np.isnan(mean_cls_deg)  else np.nan),
+            "Mean_angle_null_deg":   (round(mean_null_deg, 3)
+                                      if not np.isnan(mean_null_deg) else np.nan),
+            "Angular_inertia_ratio": (round(ang_ratio,     4)
+                                      if not np.isnan(ang_ratio)     else np.nan),
+            "MannWhitney_p":         (round(mwu_p,         6)
+                                      if not np.isnan(mwu_p)         else np.nan),
+            "Effect_size":           (round(effect_r,      4)
+                                      if not np.isnan(effect_r)      else np.nan),
         })
 
         # ── 4. Moran's I spatial autocorrelation ─────────────────────────
@@ -1688,6 +1748,13 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
         summary_rows.append(row)
 
         # ── Validation figure ─────────────────────────────────────────────
+        # Prefer the angular-inertia null distribution for the histogram
+        # overlay (same background population, correct endmember angles).
+        # Fall back to null_angles_dist from derive_null_thresholds when
+        # mineral_spectra was not provided.
+        _fig_null_angles = (_angles_null_ai
+                            if _angles_null_ai is not None
+                            else (null_angles_dist if _null_valid else None))
         _save_validation_figure(
             name, short, soil_mask,
             binary_mask, labeled, comp_sizes,
@@ -1696,7 +1763,7 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
             mean_a, std_a, skewness, dist_quality,
             thr, val_dir,
             null_thr=null_thr if _null_valid else None,
-            null_angles=null_angles_dist if _null_valid else None,
+            null_angles=_fig_null_angles,
         )
         safe = name.replace(' ', '_').replace('(', '').replace(')', '')
         print(f"     Figure saved: {safe}_validation.png")
@@ -1712,7 +1779,9 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
             "Mineral", "Pixels", "Null_thr_deg", "Null_pixels",
             "Components", "Noise_px_frac",
             "Mean_angle_deg", "Std_angle_deg", "Skewness",
-            "Inertia_ratio", "Morans_I", "Morans_p", "Morans_sig",
+            "Mean_angle_cls_deg", "Mean_angle_null_deg",
+            "Angular_inertia_ratio", "MannWhitney_p", "Effect_size",
+            "Morans_I", "Morans_p", "Morans_sig",
         ]
         display_cols = [c for c in display_cols if c in df.columns]
         print(df[display_cols].to_string(index=False))
