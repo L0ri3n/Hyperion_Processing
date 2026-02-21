@@ -413,8 +413,125 @@ If you encounter problems:
 5. Reduce threshold if no detections occur
 6. Increase threshold if too many false positives
 
+---
+
+## Supervised Classification Extension (February 2026)
+
+Two additional modules extend the workflow with a scene-specific supervised
+classification that runs after the SAM stage and compares results against it.
+
+### Overview
+
+```
+Stage 1  multi_mineral_sam_fixed.py   → SAM classification + soil_mask.npy
+Stage 2  training_pixel_selector.py   → Interactive training pixel labelling
+Stage 3  supervised_classification.py → Random Forest classification + validation
+```
+
+Run all three stages with:
+
+```bash
+python run_pipeline.py
+```
+
+Or run individual stages:
+
+```bash
+python run_pipeline.py --stage sam      # Stage 1 only
+python run_pipeline.py --stage select   # Stage 2 only (interactive)
+python run_pipeline.py --stage rf       # Stage 3 only
+python run_pipeline.py --skip-sam       # Stages 2+3 (soil_mask.npy must exist)
+```
+
+---
+
+### 4. `training_pixel_selector.py` — Interactive Training GUI
+
+Opens a full-screen dark-themed matplotlib window.
+
+**Image composites** (switchable via radio buttons):
+
+| View | Bands | Use |
+|------|-------|-----|
+| RGB | 660 / 550 / 480 nm | True-colour context |
+| NIR False Colour | 850 / 660 / 550 nm | Vegetation vs bare soil |
+| Fe³⁺ Oxide Ratio | 900 / 660 nm (ratio) | Iron oxide intensity |
+
+**AMD target classes:** Goethite, Hematite, Jarosite\_Na, Jarosite\_K,
+Schwertmannite, Pyrite, Background.
+
+**How to use:**
+1. Select a View and a Class using the radio buttons.
+2. Left-click + drag to draw a rectangular ROI on the image.
+3. The spectral profile panel (right) shows the mean ± 1σ spectrum of
+   the selected soil pixels and reference lines at 430, 660, 875 nm.
+4. Repeat for all classes.
+5. Click **Save & Continue** to write `training_pixels.npz` and close.
+
+**Soil mask overlay** (yellow semi-transparent fill, toggleable) shows
+which pixels are eligible for inclusion in the training set.
+
+**Output:** `amd_mapping/outputs/training_pixels.npz`
+
+---
+
+### 5. `supervised_classification.py` — Random Forest Classification
+
+**Classifier:**
+```python
+RandomForestClassifier(n_estimators=200, class_weight='balanced', random_state=42)
+```
+
+**Pipeline:**
+1. Load training pixels from `.npz`; extract spectral feature vectors (all bands).
+2. 5-fold stratified cross-validation — reports balanced accuracy per fold and mean ± std.
+3. Apply classifier to all soil-masked pixels; reject predictions with max class
+   probability < 0.60.
+4. Connected-component noise filter (< 4 px), matching the SAM post-processing.
+5. Validation metrics:
+   - Noise fraction per class
+   - Moran's I spatial clustering (Queen contiguity within soil domain)
+   - MDI feature importances plotted against wavelength
+   - Mean / std of max class probability per mineral
+
+**Cross-method comparison:**
+For each mineral class, Jaccard IoU between the RF binary mask and the SAM binary
+mask is computed and saved.  IoU > 0.5 indicates spatial agreement between the
+two independent methods.
+
+**Key configuration constants:**
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `RF_N_ESTIMATORS` | 200 | Number of trees |
+| `RF_CLASS_WEIGHT` | `'balanced'` | Weight inversely proportional to class frequency |
+| `PROB_THRESHOLD` | 0.60 | Minimum max probability to accept prediction |
+| `MIN_COMPONENT_SIZE` | 4 | Noise component size threshold (pixels) |
+| `EXCLUDE_BACKGROUND` | `True` | Relabel Background predictions to Unclassified |
+| `CV_FOLDS` | 5 | Number of stratified CV folds |
+
+**Outputs** (all written to `amd_mapping/outputs/supervised_classification/`):
+
+| File | Description |
+|------|-------------|
+| `rf_classification_map.tif` | GeoTIFF classification map (int16) |
+| `rf_classification_map.hdr/.img` | Same map in ENVI format |
+| `rf_probability_maps.hdr/.img` | Per-class posterior probabilities (float32) |
+| `rf_classification_map.png` | Colour visualisation with legend |
+| `rf_cv_scores.csv` | Balanced accuracy per CV fold |
+| `rf_validation_metrics.csv` | Per-class noise frac, Moran's I, max-prob stats |
+| `rf_cross_method_comparison.csv` | Jaccard IoU: RF vs SAM per mineral class |
+| `validation/rf_feature_importances.csv` | MDI importance per band + wavelength |
+| `validation/rf_feature_importances.png` | Bar chart of top-30 bands by MDI |
+
+---
+
 ## Citation
 
 If you use these scripts in research, please cite the original SAM algorithm:
 
 > Kruse, F. A., et al. (1993). The spectral image processing system (SIPS)—interactive visualization and analysis of imaging spectrometer data. Remote sensing of environment, 44(2-3), 145-163.
+
+For the Random Forest classifier:
+
+> Breiman, L. (2001). Random forests. Machine learning, 45(1), 5-32.

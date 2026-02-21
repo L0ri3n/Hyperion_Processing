@@ -535,6 +535,13 @@ def main():
     print(f"   Soil pixels: {n_soil} / {n_total} ({n_soil / n_total * 100:.1f}%)")
     print(f"   Excluded pixels: {n_total - n_soil} ({(n_total - n_soil) / n_total * 100:.1f}%)")
 
+    # Persist soil mask as soil_mask.npy next to the reflectance cube so that
+    # training_pixel_selector.py and supervised_classification.py can load it
+    # without recomputing it from scratch.
+    soil_mask_npy = Path(HDR_FILE).parent / "soil_mask.npy"
+    np.save(str(soil_mask_npy), soil_mask)
+    print(f"   Soil mask saved: {soil_mask_npy}")
+
     # Save soil mask diagnostic plot
     print(f"\n5. Saving pre-classification diagnostics...")
     save_soil_mask_plot(soil_mask, ndvi, mndwi, OUTPUT_FOLDER)
