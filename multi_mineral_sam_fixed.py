@@ -37,6 +37,16 @@ SOIL_MASK_MEDIAN_SIZE = 3
 # Morphological disk radius for opening/closing cleanup
 SOIL_MASK_MORPH_RADIUS = 2
 
+# Null-model threshold parameters
+# Confidence level: the SAM threshold is set to the (1 - NULL_MODEL_CONFIDENCE)*100-th
+# percentile of spectral angles measured on random background soil pixels.
+# E.g. 0.95 → 5th percentile: a pixel must have a lower angle than 95% of all
+# background pixels to be considered statistically distinguishable from background.
+NULL_MODEL_CONFIDENCE = 0.95
+# Maximum number of background pixels sampled per mineral for the null model.
+# Larger values give more stable percentile estimates at the cost of runtime.
+NULL_SAMPLE_SIZE = 5000
+
 SAVE_INDIVIDUAL_MAPS = True
 SAVE_COMPOSITE_MAP = True
 SHOW_PLOTS = False
@@ -225,8 +235,243 @@ def compute_soil_mask(cube, wavelengths):
 
 
 # =============================================================================
+# NULL-MODEL THRESHOLD DERIVATION
+# =============================================================================
+
+def derive_null_thresholds(sam_angles_dict, adaptive_thresholds, soil_mask,
+                           cube, mineral_spectra, mineral_names,
+                           confidence=NULL_MODEL_CONFIDENCE,
+                           n_samples=NULL_SAMPLE_SIZE):
+    """Derive per-mineral SAM thresholds from a spectral-angle null model.
+
+    For each mineral endmember the function:
+      1. Identifies 'background' soil pixels — soil pixels not classified by
+         *any* mineral under the current adaptive threshold.
+      2. Draws up to ``n_samples`` random background pixels (seed fixed to 42).
+      3. Computes SAM angles between the endmember and each background pixel
+         (efficient batch dot-product; endmembers are already unit-normalised).
+      4. Returns the ``(1 - confidence) * 100``-th percentile of that angle
+         distribution as the null-derived threshold.
+
+    Interpretation: a pixel passes the null threshold only if its SAM angle is
+    smaller than ``confidence * 100``% of all random background pixels, making
+    it statistically distinguishable from background at the chosen confidence
+    level.
+
+    Parameters
+    ----------
+    sam_angles_dict : dict {name -> (rows, cols) ndarray}
+        Per-mineral SAM angle images (non-soil pixels set to pi).
+    adaptive_thresholds : dict {name -> float}
+        Per-mineral adaptive thresholds already derived (min + margin).
+    soil_mask : (rows, cols) bool ndarray
+    cube : (rows, cols, bands) float32 ndarray
+        Reflectance cube; used to extract background pixel spectra.
+    mineral_spectra : dict {name -> (bands,) ndarray}
+        Unit-normalised endmember spectra.
+    mineral_names : list of str
+    confidence : float, default ``NULL_MODEL_CONFIDENCE``
+        Fraction in (0, 1).  Threshold = (1 - confidence) * 100-th percentile.
+    n_samples : int, default ``NULL_SAMPLE_SIZE``
+        Maximum number of background pixels to sample.
+
+    Returns
+    -------
+    null_thresholds : dict {name -> float}  (radians; NaN if model skipped)
+    null_distributions : dict {name -> 1-D ndarray}  (sampled null angles, radians)
+    """
+    percentile_pct = (1.0 - confidence) * 100.0   # e.g. 5.0 for 95% confidence
+
+    # Build a unified "classified by any mineral under adaptive threshold" mask
+    classified_any = np.zeros(soil_mask.shape, dtype=bool)
+    for name in mineral_names:
+        classified_any |= (sam_angles_dict[name] < adaptive_thresholds[name]) & soil_mask
+
+    # Background = soil pixels not captured by any adaptive threshold
+    bg_mask = soil_mask & ~classified_any
+    bg_r, bg_c = np.where(bg_mask)
+    n_bg = len(bg_r)
+
+    print("\n" + "=" * 70)
+    print(f"NULL-MODEL THRESHOLD DERIVATION  "
+          f"(confidence = {confidence * 100:.0f}%,  "
+          f"threshold = {percentile_pct:.0f}th percentile of null angles)")
+    print("=" * 70)
+    print(f"  Background pixels available : {n_bg:,}  "
+          f"(soil pixels unclassified under any adaptive threshold)")
+
+    null_thresholds    = {}
+    null_distributions = {}
+
+    if n_bg < 10:
+        print("  WARNING: fewer than 10 background pixels — null model skipped.")
+        for name in mineral_names:
+            null_thresholds[name]    = np.nan
+            null_distributions[name] = np.array([])
+        return null_thresholds, null_distributions
+
+    np.random.seed(42)
+    sample_size = min(n_samples, n_bg)
+    idx_s  = np.random.choice(n_bg, size=sample_size, replace=False)
+    bg_r_s = bg_r[idx_s]
+    bg_c_s = bg_c[idx_s]
+
+    # Extract background spectra once — shared across all minerals
+    bg_spectra = cube[bg_r_s, bg_c_s, :].astype(np.float64)  # (sample_size, bands)
+    _impute_nan_bands(bg_spectra)
+
+    bg_norms   = np.linalg.norm(bg_spectra, axis=1)           # (sample_size,)
+    safe_norms = np.where(bg_norms == 0, 1e-10, bg_norms)
+
+    print(f"  Sampled {sample_size:,} background pixels for null distributions\n")
+
+    cw = (25, 16, 14, 18, 18)
+    header = (f"  {'Mineral':<{cw[0]}} "
+              f"{'Null thr (rad)':>{cw[1]}} "
+              f"{'Null thr (°)':>{cw[2]}} "
+              f"{'Min null (°)':>{cw[3]}} "
+              f"{'Max null (°)':>{cw[4]}}")
+    print(header)
+    print("  " + "-" * (sum(cw) + len(cw)))
+
+    for name in mineral_names:
+        endmember = mineral_spectra[name]        # unit-normalised → its norm = 1
+        cos_vals  = (bg_spectra @ endmember) / safe_norms
+        cos_vals  = np.clip(cos_vals, -1.0, 1.0)
+        null_angles = np.arccos(cos_vals)
+
+        null_thr = float(np.percentile(null_angles, percentile_pct))
+        null_thresholds[name]    = null_thr
+        null_distributions[name] = null_angles
+
+        short = short_mineral_name(name)
+        print(f"  {short:<{cw[0]}} "
+              f"{null_thr:>{cw[1]}.4f} "
+              f"{np.degrees(null_thr):>{cw[2]}.2f}\u00b0 "
+              f"{np.degrees(null_angles.min()):>{cw[3]}.2f}\u00b0 "
+              f"{np.degrees(null_angles.max()):>{cw[4]}.2f}\u00b0")
+
+    print()
+    return null_thresholds, null_distributions
+
+
+# =============================================================================
 # MAIN PROCESSING
 # =============================================================================
+
+def compare_thresholds(sam_angles_dict, soil_mask, adaptive_thresholds,
+                       null_thresholds, mineral_names, cube,
+                       confidence=NULL_MODEL_CONFIDENCE):
+    """Print a side-by-side comparison of adaptive vs null-derived thresholds.
+
+    For each mineral the function reports:
+    * The threshold angle (degrees) under each method.
+    * How many soil pixels survive each threshold.
+    * The KMeans inertia ratio (real / null-background) under each threshold,
+      recomputed independently so the comparison is self-contained.
+
+    Parameters
+    ----------
+    sam_angles_dict : dict {name -> (rows, cols) ndarray}
+    soil_mask : (rows, cols) bool ndarray
+    adaptive_thresholds : dict {name -> float}
+    null_thresholds : dict {name -> float}  (may contain NaN if model failed)
+    mineral_names : list of str
+    cube : (rows, cols, bands) float32 ndarray
+    confidence : float  — displayed in the section header only.
+    """
+    try:
+        from sklearn.cluster import KMeans as _KMeans
+        HAS_SKLEARN = True
+    except ImportError:
+        HAS_SKLEARN = False
+
+    print("\n" + "=" * 70)
+    print(f"THRESHOLD COMPARISON  "
+          f"(adaptive  vs  null-model @ {confidence * 100:.0f}% confidence)")
+    print("=" * 70)
+
+    np.random.seed(42)
+
+    # Background mask for inertia: soil pixels not claimed by any adaptive thr
+    classified_any = np.zeros(soil_mask.shape, dtype=bool)
+    for name in mineral_names:
+        classified_any |= (sam_angles_dict[name] < adaptive_thresholds[name]) & soil_mask
+    bg_mask_global = soil_mask & ~classified_any
+    bg_r_g, bg_c_g = np.where(bg_mask_global)
+
+    def _inertia_ratio(binary_mask):
+        """KMeans inertia ratio (real classified pixels / random background)."""
+        n_cls = int(binary_mask.sum())
+        if n_cls < 2 or not HAS_SKLEARN:
+            return np.nan
+        r_idx, c_idx = np.where(binary_mask)
+        sp_real = cube[r_idx, c_idx, :].astype(np.float64)
+        _impute_nan_bands(sp_real)
+        km = _KMeans(n_clusters=1, n_init=1, random_state=42)
+        km.fit(sp_real)
+        inertia_real = km.inertia_
+
+        n_null = min(n_cls, len(bg_r_g))
+        if n_null < 2:
+            return np.nan
+        idx_s  = np.random.choice(len(bg_r_g), size=n_null, replace=False)
+        sp_null = cube[bg_r_g[idx_s], bg_c_g[idx_s], :].astype(np.float64)
+        _impute_nan_bands(sp_null)
+        km_null = _KMeans(n_clusters=1, n_init=1, random_state=42)
+        km_null.fit(sp_null)
+        return (inertia_real / km_null.inertia_
+                if km_null.inertia_ > 0 else np.nan)
+
+    hdr = (f"  {'Mineral':<20} "
+           f"{'Adapt thr (°)':>14} {'Adapt px':>10} {'Iner_A':>8} "
+           f"{'Null thr (°)':>14} {'Null px':>10} {'Iner_N':>8} "
+           f"{'Δ px':>9}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+
+    for name in mineral_names:
+        short      = short_mineral_name(name)
+        adap_thr   = adaptive_thresholds[name]
+        null_thr   = null_thresholds[name]
+        sam_angles = sam_angles_dict[name]
+
+        adap_mask = (sam_angles < adap_thr) & soil_mask
+        n_adap    = int(adap_mask.sum())
+        ratio_adap = _inertia_ratio(adap_mask)
+
+        if np.isnan(null_thr):
+            n_null     = 0
+            ratio_null = np.nan
+            thr_null_s = f"{'N/A':>14}"
+            n_null_s   = f"{'N/A':>10}"
+            delta      = 0
+        else:
+            null_mask  = (sam_angles < null_thr) & soil_mask
+            n_null     = int(null_mask.sum())
+            ratio_null = _inertia_ratio(null_mask)
+            thr_null_s = f"{np.degrees(null_thr):>13.2f}\u00b0"
+            n_null_s   = f"{n_null:>10,}"
+            delta      = n_null - n_adap
+
+        r_a = f"{ratio_adap:.4f}" if not np.isnan(ratio_adap) else "   N/A"
+        r_n = f"{ratio_null:.4f}" if not np.isnan(ratio_null) else "   N/A"
+
+        print(f"  {short:<20} "
+              f"{np.degrees(adap_thr):>13.2f}\u00b0 {n_adap:>10,} {r_a:>8} "
+              f"{thr_null_s} {n_null_s} {r_n:>8} "
+              f"{delta:>+9,}")
+
+    print()
+    if not HAS_SKLEARN:
+        print("  NOTE: scikit-learn not found — inertia ratios skipped.")
+    print("  \u0394 px     = null-threshold pixels \u2212 adaptive-threshold pixels")
+    print("  Iner_A  = inertia ratio under adaptive threshold  (real / background)")
+    print("  Iner_N  = inertia ratio under null-model threshold")
+    print("  Inertia ratio < 1.0  \u2192  classified pixels more spectrally coherent "
+          "than random soil")
+    print("=" * 70)
+
 
 def main():
     """Main processing workflow"""
@@ -307,13 +552,22 @@ def main():
         print(f"   {mineral_name}: min angle (soil only) = {soil_min:.4f} rad")
 
     # Derive per-mineral thresholds: min_angle * (1 + margin)
-    print(f"\n7. Deriving thresholds (margin = {SAM_THRESHOLD_MARGIN:.0%} above minimum angle)...")
+    print(f"\n7. Deriving adaptive thresholds (margin = {SAM_THRESHOLD_MARGIN:.0%} above minimum angle)...")
     thresholds = {}
     for name in mineral_names:
         soil_angles = sam_angles_dict[name][soil_mask]
         min_angle = np.min(soil_angles) if len(soil_angles) > 0 else np.pi
         thresholds[name] = min_angle * (1 + SAM_THRESHOLD_MARGIN)
         print(f"     {name}: {thresholds[name]:.4f} rad ({np.degrees(thresholds[name]):.1f}°)")
+
+    # Derive null-model thresholds (statistical, background-anchored)
+    print(f"\n7b. Deriving null-model thresholds "
+          f"(confidence = {NULL_MODEL_CONFIDENCE * 100:.0f}%, "
+          f"sample size = {NULL_SAMPLE_SIZE:,})...")
+    null_thresholds, null_distributions = derive_null_thresholds(
+        sam_angles_dict, thresholds, soil_mask,
+        cube, mineral_spectra, mineral_names,
+    )
 
     # Compute match scores and statistics
     print(f"\n8. Computing match scores...")
@@ -348,10 +602,19 @@ def main():
         create_composite_map(sam_angles_dict, match_scores_dict,
                            mineral_names, thresholds, soil_mask, OUTPUT_FOLDER)
 
+    # Compare adaptive vs null-model thresholds
+    print("\n9b. Comparing adaptive vs null-model thresholds...")
+    compare_thresholds(
+        sam_angles_dict, soil_mask, thresholds,
+        null_thresholds, mineral_names, cube,
+    )
+
     # Post-classification validation
     print("\n10. Running post-classification validation...")
     validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
-                         mineral_names, OUTPUT_FOLDER)
+                         mineral_names, OUTPUT_FOLDER,
+                         null_thresholds=null_thresholds,
+                         null_distributions=null_distributions)
 
     print("\n" + "=" * 70)
     print("PROCESSING COMPLETE!")
@@ -1059,7 +1322,8 @@ def _save_validation_figure(name, short, soil_mask,
                              n_noise_comps,
                              hist, bin_edges, bin_centers,
                              mean_a, std_a, skewness, dist_quality,
-                             thr, val_dir):
+                             thr, val_dir,
+                             null_thr=None, null_angles=None):
     """Save a two-panel validation figure per mineral.
 
     Left panel  – SAM angle histogram (30 bins, [0, threshold]) with mean
@@ -1069,11 +1333,43 @@ def _save_validation_figure(name, short, soil_mask,
     """
     fig, (ax_hist, ax_map) = plt.subplots(1, 2, figsize=(13, 5.5))
 
-    # ── Left: SAM angle histogram ─────────────────────────────────────────
+    # ── Left: SAM angle histogram with optional null-model overlay ────────
+    _has_null = (null_thr is not None and null_angles is not None
+                 and len(null_angles) > 0 and not np.isnan(null_thr))
+    display_max = max(thr, null_thr) * 1.05 if _has_null else thr
+
+    # Null-model background distribution (plotted first, sits behind)
+    if _has_null:
+        null_hist_vals, null_bin_edges = np.histogram(
+            null_angles, bins=30, range=(0.0, float(display_max)))
+        null_centers  = 0.5 * (null_bin_edges[:-1] + null_bin_edges[1:])
+        null_bin_w_d  = np.degrees(null_bin_edges[1] - null_bin_edges[0])
+        # Scale null histogram so its peak sits at 60% of classified histogram peak
+        peak_cls  = float(hist.max())  if hist.max()           > 0 else 1.0
+        peak_null = float(null_hist_vals.max()) if null_hist_vals.max() > 0 else 1.0
+        scale     = peak_cls * 0.6 / peak_null
+        ax_hist.bar(np.degrees(null_centers), null_hist_vals * scale,
+                    width=null_bin_w_d * 0.88,
+                    color='#AAAAAA', edgecolor='white', linewidth=0.3,
+                    alpha=0.60, zorder=2,
+                    label=f'Null/background (n={len(null_angles):,}, scaled)')
+
+    # Classified pixel angle distribution
     bin_w_deg = np.degrees(bin_edges[1] - bin_edges[0])
     ax_hist.bar(np.degrees(bin_centers), hist,
                 width=bin_w_deg * 0.88,
-                color='#3A7ABF', edgecolor='white', linewidth=0.3)
+                color='#3A7ABF', edgecolor='white', linewidth=0.3,
+                zorder=3,
+                label=f'Classified pixels (n={int(hist.sum()):,})')
+
+    # Threshold vertical lines
+    ax_hist.axvline(np.degrees(thr),
+                    color='#9467BD', linestyle='--', linewidth=1.5, zorder=4,
+                    label=f'Adaptive thr = {np.degrees(thr):.2f}\u00b0')
+    if _has_null:
+        ax_hist.axvline(np.degrees(null_thr),
+                        color='#2CA02C', linestyle='-.', linewidth=1.5, zorder=4,
+                        label=f'Null thr = {np.degrees(null_thr):.2f}\u00b0')
     ax_hist.axvline(np.degrees(mean_a),
                     color='#D62728', linestyle='--', linewidth=1.5,
                     label=f'Mean = {np.degrees(mean_a):.2f}\u00b0')
@@ -1087,9 +1383,9 @@ def _save_validation_figure(name, short, soil_mask,
         f'{short} \u2014 SAM Angle Distribution\n'
         f'Skewness = {skewness:.3f}  \u2022  {dist_quality}',
         fontsize=10)
-    ax_hist.legend(fontsize=9)
+    ax_hist.legend(fontsize=8)
     ax_hist.grid(True, alpha=0.25)
-    ax_hist.set_xlim(0, np.degrees(thr))
+    ax_hist.set_xlim(0, np.degrees(display_max))
 
     # ── Right: component size map ─────────────────────────────────────────
     # Base layer: white = nodata, light-gray = soil domain
@@ -1132,7 +1428,8 @@ def _save_validation_figure(name, short, soil_mask,
 
 
 def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
-                         mineral_names, output_folder):
+                         mineral_names, output_folder,
+                         null_thresholds=None, null_distributions=None):
     """Post-classification validation of SAM results.
 
     Four metrics are computed independently for each mineral class:
@@ -1218,7 +1515,25 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
         binary_mask  = (sam_angles < thr) & soil_mask
         n_classified = int(binary_mask.sum())
 
-        print(f"\n  \u2500\u2500 {short} \u2500\u2500 ({n_classified} classified pixels)")
+        # Null-model threshold info for this mineral (may be None/NaN if skipped)
+        null_thr        = (null_thresholds.get(name, np.nan)
+                           if null_thresholds else np.nan)
+        null_angles_dist = (null_distributions.get(name, np.array([]))
+                            if null_distributions else np.array([]))
+        _null_valid = null_thresholds is not None and not np.isnan(null_thr)
+        if _null_valid:
+            null_binary_mask  = (sam_angles < null_thr) & soil_mask
+            n_null_classified = int(null_binary_mask.sum())
+        else:
+            n_null_classified = 0
+
+        if _null_valid:
+            print(f"\n  \u2500\u2500 {short} \u2500\u2500  "
+                  f"adaptive: {n_classified:,} px  |  "
+                  f"null-model ({NULL_MODEL_CONFIDENCE * 100:.0f}%): "
+                  f"{n_null_classified:,} px")
+        else:
+            print(f"\n  \u2500\u2500 {short} \u2500\u2500 ({n_classified} classified pixels)")
         row = {"Mineral": short, "Pixels": n_classified}
 
         if n_classified == 0:
@@ -1363,6 +1678,13 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
             "Morans_sig": moran_sig,
         })
 
+        # Null-model threshold columns
+        row.update({
+            "Null_thr_deg": (round(np.degrees(null_thr), 3)
+                             if _null_valid else np.nan),
+            "Null_pixels":  n_null_classified,
+        })
+
         summary_rows.append(row)
 
         # ── Validation figure ─────────────────────────────────────────────
@@ -1373,6 +1695,8 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
             hist, bin_edges, bin_centers,
             mean_a, std_a, skewness, dist_quality,
             thr, val_dir,
+            null_thr=null_thr if _null_valid else None,
+            null_angles=null_angles_dist if _null_valid else None,
         )
         safe = name.replace(' ', '_').replace('(', '').replace(')', '')
         print(f"     Figure saved: {safe}_validation.png")
@@ -1385,7 +1709,8 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
     if summary_rows:
         df = pd.DataFrame(summary_rows)
         display_cols = [
-            "Mineral", "Pixels", "Components", "Noise_px_frac",
+            "Mineral", "Pixels", "Null_thr_deg", "Null_pixels",
+            "Components", "Noise_px_frac",
             "Mean_angle_deg", "Std_angle_deg", "Skewness",
             "Inertia_ratio", "Morans_I", "Morans_p", "Morans_sig",
         ]

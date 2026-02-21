@@ -75,12 +75,51 @@ python multi_mineral_sam_parallel.py
 
 ## Configuration Options
 
-### Basic Settings
+### Threshold Strategy
+
+`multi_mineral_sam_fixed.py` derives **two complementary thresholds** for each mineral:
+
+| Threshold | Config key | How it works |
+|---|---|---|
+| **Adaptive** | `SAM_THRESHOLD_MARGIN` | `min_angle × (1 + margin)` — anchored to the closest-matching soil pixel |
+| **Null-model** | `NULL_MODEL_CONFIDENCE` | Nth-percentile of SAM angles measured on random background pixels |
 
 ```python
-SAM_THRESHOLD = 0.1  # Radians (~5.7°)
-                     # Lower = stricter matching
-                     # Higher = more detections
+# Adaptive threshold: 1% above the minimum angle found in soil pixels
+SAM_THRESHOLD_MARGIN = 0.01
+
+# Null-model threshold
+# A pixel must have a lower angle than NULL_MODEL_CONFIDENCE × 100% of
+# random background soil pixels to be considered a statistically
+# significant detection.  Default: 95% confidence → 5th percentile.
+NULL_MODEL_CONFIDENCE = 0.95
+
+# Number of background pixels sampled per mineral for the null model.
+# Increase for larger or more heterogeneous scenes.
+NULL_SAMPLE_SIZE = 5000
+```
+
+The **adaptive threshold** drives the match scores and output maps (unchanged
+behaviour).  The **null-model threshold** is computed in step 7b of `main()` and
+reported alongside the adaptive results — it provides a statistically grounded
+reference point without replacing the primary classification.
+
+#### Why two thresholds?
+
+The adaptive threshold is intentionally tight (it tracks the single best-matching
+pixel) so the match-score maps highlight only the most confident detections.  The
+null-model threshold answers the complementary question: *how many pixels are
+detectably different from random background at a given confidence level?*
+Comparing the two helps identify whether the classification is capturing a small
+cluster of extreme matches (adaptive) or a broader population of spectrally
+similar pixels (null-model).
+
+### Output Control
+
+```python
+SAVE_INDIVIDUAL_MAPS = True   # Save PNG for each mineral
+SAVE_COMPOSITE_MAP = True     # Save composite classification map
+SHOW_PLOTS = False            # Set True to display plots interactively
 ```
 
 ### Output Control
@@ -168,43 +207,43 @@ Shows the **dominant mineral** at each pixel based on:
 - Use sequential version instead
 
 ### Problem: All pixels classified as one mineral
-**Solution**: Your threshold might be too high
-- Try reducing `SAM_THRESHOLD` (e.g., from 0.1 to 0.08)
-- Check if mineral spectra are properly normalized
+**Solution**: The adaptive threshold may be too permissive for one endmember
+- Inspect the `compare_thresholds` table printed in step 9b; an unusually large
+  Δ px indicates that endmember is attracting many background-like pixels
+- Raise `SAM_THRESHOLD_MARGIN` slightly (e.g., `0.05`) to tighten the adaptive window
+- Or use `NULL_MODEL_CONFIDENCE` as the primary threshold by post-filtering with it
+- Check if mineral spectra are properly normalised
 
 ---
 
 ## Advanced Customization
 
-### Adjust Detection Threshold for Composite Map
+### Adjust the Null-Model Confidence Level
 
-In the `create_composite_map` function, change this line:
+Change `NULL_MODEL_CONFIDENCE` at the top of the script:
+
 ```python
-# Current: pixels with score > 0.5 are classified
-composite_map = np.where(max_score > 0.5, max_idx + 1, 0)
+# More permissive: 90% confidence → 10th percentile of background angles
+NULL_MODEL_CONFIDENCE = 0.90
 
-# More strict: only pixels with score > 0.7
-composite_map = np.where(max_score > 0.7, max_idx + 1, 0)
+# More restrictive: 99% confidence → 1st percentile of background angles
+NULL_MODEL_CONFIDENCE = 0.99
 ```
 
-### Change Color Scheme
+Larger sample sizes give more stable percentile estimates for heterogeneous scenes:
 
-For individual maps:
 ```python
-# Current: 'inferno' colormap
-im = ax.imshow(match_score, cmap='inferno', vmin=0, vmax=1)
-
-# Try: 'viridis', 'plasma', 'hot', 'jet', etc.
-im = ax.imshow(match_score, cmap='viridis', vmin=0, vmax=1)
+NULL_SAMPLE_SIZE = 10000   # double the default; slower but more stable
 ```
 
-For composite map:
-```python
-# Current: 'tab20' for up to 20 minerals
-cmap = plt.cm.get_cmap('tab20', n_classes)
+### Adjust the Adaptive Threshold Margin
 
-# Try: 'Set1', 'Set3', 'Paired', etc.
-cmap = plt.cm.get_cmap('Set3', n_classes)
+```python
+# Tighter (fewer pixels, higher confidence per pixel)
+SAM_THRESHOLD_MARGIN = 0.05   # 5% above minimum
+
+# Looser (more pixels, lower per-pixel confidence)
+SAM_THRESHOLD_MARGIN = 0.20   # 20% above minimum
 ```
 
 ### Export as GeoTIFF (for GIS)

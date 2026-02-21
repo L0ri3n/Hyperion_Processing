@@ -18,11 +18,12 @@ docs/
 │   ├── WORKFLOW_DIAGRAM.md           - Visual flowcharts
 │   └── SETUP_AND_USAGE_GUIDE.md      - Setup instructions
 │
-└── changelogs/                    (4 documents)
+└── changelogs/                    (5 documents)
     ├── SAM_Implementation_Report.md   - SAM debugging
     ├── INTEGRATION_SUMMARY.md         - USGS library integration
     ├── ENDMEMBER_FIX_SUMMARY.md       - SNAP library compatibility
-    └── SAM_OUTPUT_FIX_SUMMARY.md      - SNAP output compatibility
+    ├── SAM_OUTPUT_FIX_SUMMARY.md      - SNAP output compatibility
+    └── NULL_MODEL_THRESHOLD.md        - Statistical null-model thresholding
 ```
 
 ## What's What
@@ -41,6 +42,7 @@ Technical documentation of fixes and improvements:
 - **Integration Summary:** Adding USGS spectral library
 - **Endmember Fix:** Making library SNAP-compatible
 - **SAM Output Fix:** Making classification results SNAP-compatible
+- **Null-Model Threshold:** Replacing the arbitrary min-angle threshold with a background-anchored statistical threshold
 
 ## For Different Users
 

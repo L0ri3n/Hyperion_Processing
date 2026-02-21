@@ -219,6 +219,30 @@ Technical reports documenting fixes, improvements, and integrations.
 
 ---
 
+### [NULL_MODEL_THRESHOLD.md](changelogs/NULL_MODEL_THRESHOLD.md)
+**Date:** February 2026
+**Feature:** Statistically grounded SAM threshold derived from a background null model
+
+**Summary:**
+- **Problem:** The original adaptive threshold (`min_angle × 1.01`) is arbitrary and
+  gives no indication of whether classified pixels are distinguishable from random
+  background soil at any meaningful confidence level.
+- **Solution:** For each mineral endmember, spectral angles are computed against a
+  random sample of unclassified background soil pixels.  The **5th percentile** of
+  this null distribution becomes the threshold, so only pixels more similar to the
+  endmember than 95 % of random background pixels are classified.
+- **New functions:** `derive_null_thresholds` (percentile computation),
+  `compare_thresholds` (adaptive vs null side-by-side table with inertia ratios).
+- **Outputs:** per-mineral null threshold table (step 7b), comparison table with
+  inertia ratios (step 9b), null distribution overlay on validation histogram,
+  `Null_thr_deg` / `Null_pixels` columns in `validation_summary.csv`.
+- **Key parameters:** `NULL_MODEL_CONFIDENCE = 0.95`, `NULL_SAMPLE_SIZE = 5000`.
+
+**Key Achievement:** Replaced arbitrary minimum-angle threshold with a
+background-anchored statistical threshold that has a clear probabilistic interpretation.
+
+---
+
 ### [SAM_OUTPUT_FIX_SUMMARY.md](changelogs/SAM_OUTPUT_FIX_SUMMARY.md)
 **Date:** SAM output SNAP compatibility
 **Issue:** `java.io.EOFException` when opening SAM classifications in SNAP
@@ -285,13 +309,14 @@ Technical reports documenting fixes, improvements, and integrations.
   - Visual diagrams and flowcharts
 
 ### Changelogs
-- **Total:** 4 documents
-- **Issues Resolved:** 4 major compatibility/implementation issues
+- **Total:** 5 documents
+- **Issues Resolved / Features Added:** 5 major items
 - **Coverage:**
   - SAM classification debugging
   - USGS library integration
   - ENVI format compatibility
   - SNAP software compatibility
+  - Null-model statistical thresholding
 
 ---
 
@@ -320,6 +345,7 @@ Map acid mine drainage (AMD) minerals in the Rio Tinto area using Hyperion hyper
 - ✅ USGS library integrated
 - ✅ SAM implementation debugged
 - ✅ SNAP compatibility fixed
+- ✅ Null-model statistical thresholding implemented
 - 🔄 Ready for full workflow execution
 - 🔄 Awaiting Hyperion image cube
 
@@ -358,6 +384,11 @@ docs/
 ---
 
 ## Version History
+
+- **v1.1** (2026-02-21): Null-model threshold documentation
+  - Added `NULL_MODEL_THRESHOLD.md` changelog
+  - Updated project status checklist
+  - Updated `README_SAM_MultiMineral.md` thresholding section
 
 - **v1.0** (2026-01-13): Initial documentation organization
   - Created guide and changelog separation
