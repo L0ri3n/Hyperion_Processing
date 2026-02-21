@@ -124,6 +124,17 @@ CLASS_COLORS = {
     "Background": "#7F7F7F",   # neutral grey
 }
 
+# Supervised SAM: maximum SAM angle (radians) to accept a classification.
+# If None, all soil pixels are classified using the nearest-endmember rule
+# (i.e. every soil pixel is assigned to its closest class endmember).
+# Set to e.g. np.pi / 4 (≈ 45°) to reject spectrally ambiguous pixels.
+SAM_ANGLE_THRESHOLD = None
+
+# Output folder for supervised SAM results (parallel to OUTPUT_FOLDER)
+SAM_SUPERVISED_OUTPUT_FOLDER = str(
+    BASE_DIR / "amd_mapping" / "outputs" / "supervised_sam"
+)
+
 # =============================================================================
 # HELPERS
 # =============================================================================
@@ -1026,6 +1037,624 @@ def _save_comparison_figure(rf_amd, sam_any, per_mineral,
 
 
 # =============================================================================
+# SUPERVISED SAM CLASSIFICATION  (same training pixels as RF)
+# =============================================================================
+
+
+def compute_class_endmembers(X, y, class_names):
+    """Compute the mean spectral endmember for each class from training data.
+
+    The mean spectrum is computed over all valid training pixels for that class
+    and then L2-normalised so that the SAM dot-product formula reduces to a
+    simple pixel-norm division:  angle = arccos(dot(pixel, endmember) / ||pixel||).
+
+    Parameters
+    ----------
+    X : ndarray (n_samples, n_bands), float64 — NaN-imputed training spectra
+    y : ndarray (n_samples,), int             — class labels (0-indexed)
+    class_names : list of str
+
+    Returns
+    -------
+    endmembers : dict {class_name -> ndarray (n_bands,), float64}
+        L2-normalised mean spectrum per class.
+    """
+    endmembers = {}
+    print("\n  Class endmembers (mean training spectra, L2-normalised):")
+    print(f"  {'Class':<22} {'n_train':>8} {'||mean||':>10}")
+    print("  " + "-" * 44)
+
+    for cls_idx, cls_name in enumerate(class_names):
+        mask = (y == cls_idx)
+        n = int(mask.sum())
+        if n == 0:
+            print(f"  {cls_name:<22} {0:>8} {'—':>10}")
+            continue
+        mean_spec = X[mask].mean(axis=0)
+        norm = float(np.linalg.norm(mean_spec))
+        endmembers[cls_name] = mean_spec / norm if norm > 1e-12 else mean_spec
+        print(f"  {cls_name:<22} {n:>8,} {norm:>10.4f}")
+
+    return endmembers
+
+
+def apply_supervised_sam(cube, soil_mask, endmembers, class_names,
+                         angle_threshold=None):
+    """Classify all soil pixels using the SAM nearest-endmember rule.
+
+    For each soil pixel the SAM angle to every class endmember is computed.
+    The pixel is assigned to the class with the minimum angle.  If
+    *angle_threshold* is set, pixels whose minimum angle exceeds the threshold
+    are labelled Unclassified (code = -1).
+
+    Parameters
+    ----------
+    cube : ndarray (rows, cols, bands), float32
+    soil_mask : ndarray (rows, cols), bool
+    endmembers : dict {class_name -> ndarray (n_bands,), float64}
+        L2-normalised spectra from compute_class_endmembers().
+    class_names : list of str
+    angle_threshold : float or None
+        Maximum SAM angle (radians) to accept a classification.
+
+    Returns
+    -------
+    class_map : ndarray (rows, cols), int16
+        Class codes: -1 = non-soil or unclassified; 0..n-1 = class index.
+    angle_maps : dict {class_name -> ndarray (rows, cols), float32}
+        SAM angle to each endmember (soil pixels only; others = π).
+    min_angle_map : ndarray (rows, cols), float32
+        Minimum SAM angle across all classes (soil pixels only; others = π).
+    """
+    rows, cols, bands = cube.shape
+    n_classes = len(class_names)
+
+    soil_r, soil_c = np.where(soil_mask)
+    n_soil = len(soil_r)
+    print(f"\n  Classifying {n_soil:,} soil pixels with SAM...")
+
+    soil_spectra = cube[soil_r, soil_c, :].astype(np.float64)
+    _impute_nan_bands(soil_spectra)
+
+    # Pixel L2-norms (precomputed once; endmembers are already unit-normalised)
+    pixel_norms = np.linalg.norm(soil_spectra, axis=1)
+    pixel_norms = np.where(pixel_norms < 1e-12, 1e-12, pixel_norms)
+
+    angle_all = np.full((n_soil, n_classes), np.pi, dtype=np.float64)
+
+    for cls_idx, cls_name in enumerate(class_names):
+        if cls_name not in endmembers:
+            continue
+        ref = endmembers[cls_name]          # L2-normalised → ||ref|| = 1
+        dots = soil_spectra @ ref           # (n_soil,)
+        cos_a = np.clip(dots / pixel_norms, -1.0, 1.0)
+        angle_all[:, cls_idx] = np.arccos(cos_a)
+
+    min_angle = angle_all.min(axis=1)
+    pred_class = angle_all.argmin(axis=1).astype(np.int16)
+
+    n_rejected = 0
+    if angle_threshold is not None:
+        reject_mask = min_angle > angle_threshold
+        pred_class[reject_mask] = -1
+        n_rejected = int(reject_mask.sum())
+
+    n_accepted = n_soil - n_rejected
+    print(f"  Accepted classifications : {n_accepted:,} "
+          f"({n_accepted / n_soil * 100:.1f}%)")
+    if angle_threshold is not None:
+        thr_deg = np.degrees(angle_threshold)
+        print(f"  Rejected (angle > {thr_deg:.1f}°)  : {n_rejected:,} "
+              f"({n_rejected / n_soil * 100:.1f}%)")
+
+    # ── Reconstruct full-scene arrays ─────────────────────────────────────
+    class_map = np.full((rows, cols), -1, dtype=np.int16)
+    class_map[soil_r, soil_c] = pred_class
+
+    angle_maps = {}
+    for cls_idx, cls_name in enumerate(class_names):
+        amap = np.full((rows, cols), np.pi, dtype=np.float32)
+        amap[soil_r, soil_c] = angle_all[:, cls_idx].astype(np.float32)
+        angle_maps[cls_name] = amap
+
+    min_angle_map = np.full((rows, cols), np.pi, dtype=np.float32)
+    min_angle_map[soil_r, soil_c] = min_angle.astype(np.float32)
+
+    # Optionally relabel Background predictions as Unclassified
+    if EXCLUDE_BACKGROUND and "Background" in class_names:
+        bg_idx = class_names.index("Background")
+        class_map[class_map == bg_idx] = -1
+        print(f"  Background class (idx {bg_idx}) relabelled to Unclassified.")
+
+    return class_map, angle_maps, min_angle_map
+
+
+def validate_sam_supervised_results(class_map, angle_maps, min_angle_map,
+                                    soil_mask, class_names, noise_fracs,
+                                    wavelengths, endmembers, output_dir):
+    """Compute and save validation metrics for the supervised SAM classification.
+
+    Metrics computed per class
+    --------------------------
+    (a) Noise fraction — fraction of pixels removed by the connected-component
+        size filter (same method as RF validation).
+    (b) Moran's I — spatial clustering of the binary class mask within the soil
+        domain (Queen contiguity, row-standardised weights).
+    (c) Min-angle statistics — mean and std of the minimum SAM angle for
+        pixels classified as this class (lower = more spectrally distinct).
+
+    Parameters
+    ----------
+    class_map     : ndarray (rows, cols), int16
+    angle_maps    : dict {class_name -> ndarray (rows, cols), float32}
+    min_angle_map : ndarray (rows, cols), float32
+    soil_mask     : ndarray (rows, cols), bool
+    class_names   : list of str
+    noise_fracs   : dict {class_name -> float}
+    wavelengths   : ndarray (bands,), float
+    endmembers    : dict {class_name -> ndarray (n_bands,), float64}
+    output_dir    : Path
+
+    Returns
+    -------
+    val_df : pd.DataFrame
+    """
+    try:
+        import libpysal.weights as lps_weights
+        from esda import Moran
+        HAS_ESDA = True
+    except ImportError:
+        HAS_ESDA = False
+        print("  [validation] WARNING: esda/libpysal not found — "
+              "Moran's I skipped.")
+
+    val_dir = output_dir / "validation"
+    val_dir.mkdir(parents=True, exist_ok=True)
+
+    soil_r, soil_c = np.where(soil_mask)
+
+    print("\n" + "=" * 70)
+    print("SUPERVISED SAM VALIDATION METRICS")
+    print("=" * 70)
+
+    # ── Endmember spectra figure ──────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(12, 4))
+    for cls_name, spec in endmembers.items():
+        color = CLASS_COLORS.get(cls_name, "#888888")
+        ax.plot(wavelengths, spec, color=color, linewidth=1.3, label=cls_name)
+    ax.set_xlabel("Wavelength (nm)", fontsize=10)
+    ax.set_ylabel("Normalised Reflectance", fontsize=10)
+    ax.set_title(
+        "SAM Endmember Spectra — mean training spectrum per class (L2-normalised)",
+        fontsize=11, fontweight="bold",
+    )
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(str(val_dir / "sam_endmember_spectra.png"), dpi=200,
+                bbox_inches="tight")
+    plt.close()
+    print(f"\n  Endmember spectra plot saved: sam_endmember_spectra.png")
+
+    # ── Per-class metrics table ───────────────────────────────────────────
+    cw = (22, 10, 10, 13, 12, 10, 18)
+    header = (
+        f"  {'Class':<{cw[0]}} "
+        f"{'n_px':>{cw[1]}} "
+        f"{'NoiseFrac':>{cw[2]}} "
+        f"{'MeanAngle°':>{cw[3]}} "
+        f"{'StdAngle°':>{cw[4]}} "
+        f"{'Moran_I':>{cw[5]}} "
+        f"{'Significance':<{cw[6]}}"
+    )
+    print(f"\n{header}")
+    print("  " + "-" * (sum(cw) + len(cw) - 1))
+
+    records = []
+    for cls_idx, cls_name in enumerate(class_names):
+        if EXCLUDE_BACKGROUND and cls_name == "Background":
+            continue
+
+        binary = (class_map == cls_idx)
+        n_px   = int(binary.sum())
+        noise_frac = noise_fracs.get(cls_name, np.nan)
+
+        # (c) Min-angle statistics for pixels classified as this class
+        if n_px > 0:
+            cls_min_angles = min_angle_map[binary]
+            mean_ang = float(np.degrees(cls_min_angles.mean()))
+            std_ang  = float(np.degrees(cls_min_angles.std()))
+        else:
+            mean_ang = np.nan
+            std_ang  = np.nan
+
+        # (b) Moran's I
+        if HAS_ESDA and n_px >= 2:
+            mi_I, mi_z, mi_p, mi_sig = _compute_morans_i(
+                binary, soil_r, soil_c, lps_weights, Moran
+            )
+        else:
+            mi_I, mi_z, mi_p = np.nan, np.nan, np.nan
+            mi_sig = "skipped (esda missing or n=0)"
+
+        nf_str = f"{noise_frac:.3f}" if not np.isnan(noise_frac) else "N/A"
+        ma_str = f"{mean_ang:.2f}°"  if not np.isnan(mean_ang)   else "N/A"
+        sa_str = f"{std_ang:.2f}°"   if not np.isnan(std_ang)    else "N/A"
+        mi_str = f"{mi_I:.4f}"       if not np.isnan(mi_I)       else "N/A"
+
+        print(
+            f"  {cls_name:<{cw[0]}} "
+            f"{n_px:>{cw[1]},} "
+            f"{nf_str:>{cw[2]}} "
+            f"{ma_str:>{cw[3]}} "
+            f"{sa_str:>{cw[4]}} "
+            f"{mi_str:>{cw[5]}} "
+            f"{mi_sig:<{cw[6]}}"
+        )
+
+        records.append({
+            "Class":              cls_name,
+            "n_pixels":           n_px,
+            "noise_frac":         noise_frac,
+            "mean_min_angle_deg": mean_ang,
+            "std_min_angle_deg":  std_ang,
+            "moran_I":            mi_I,
+            "moran_z":            mi_z,
+            "moran_p":            mi_p,
+            "moran_sig":          mi_sig,
+        })
+
+    val_df = pd.DataFrame(records)
+    val_csv = output_dir / "sam_validation_metrics.csv"
+    val_df.to_csv(str(val_csv), index=False)
+    print(f"\n  Validation metrics saved: {val_csv.name}")
+
+    return val_df
+
+
+def save_sam_supervised_outputs(class_map, angle_maps, class_names, output_dir):
+    """Save all supervised SAM classification outputs.
+
+    Files written
+    -------------
+    sam_classification_map.tif        GeoTIFF (class codes, int16)
+    sam_classification_map.hdr/.img   ENVI classification image
+    sam_angle_maps.hdr/.img           ENVI per-class SAM angle maps (float32)
+    sam_classification_map.png        Colour visualisation with legend
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows, cols = class_map.shape
+
+    # ── GeoTIFF ──────────────────────────────────────────────────────────
+    _save_geotiff(class_map, output_dir / "sam_classification_map.tif")
+
+    # ── ENVI classification map ───────────────────────────────────────────
+    display_map = (class_map + 1).astype(np.uint16)
+    envi_meta = {
+        "lines":       rows,
+        "samples":     cols,
+        "bands":       1,
+        "data type":   12,
+        "interleave":  "bsq",
+        "byte order":  0,
+        "class names": ["Unclassified"] + class_names,
+        "classes":     len(class_names) + 1,
+        "description": "Supervised SAM classification map",
+    }
+    envi_hdr = output_dir / "sam_classification_map.hdr"
+    sp.envi.save_image(str(envi_hdr), display_map, metadata=envi_meta, force=True)
+    print(f"  ENVI classification map saved: sam_classification_map.hdr/.img")
+
+    # ── ENVI per-class angle maps ─────────────────────────────────────────
+    band_names = [cls for cls in class_names if cls in angle_maps]
+    angle_cube = np.stack(
+        [angle_maps[cls] for cls in band_names], axis=2
+    ).astype(np.float32)
+    angle_meta = {
+        "lines":       rows,
+        "samples":     cols,
+        "bands":       angle_cube.shape[2],
+        "data type":   4,
+        "interleave":  "bip",
+        "byte order":  0,
+        "band names":  band_names,
+        "description": "Supervised SAM per-class angle maps (radians)",
+    }
+    angle_hdr = output_dir / "sam_angle_maps.hdr"
+    sp.envi.save_image(str(angle_hdr), angle_cube, metadata=angle_meta, force=True)
+    print(f"  ENVI angle maps saved: sam_angle_maps.hdr/.img")
+
+    # ── Colour visualisation ─────────────────────────────────────────────
+    _save_sam_supervised_figure(class_map, class_names, output_dir)
+
+
+def _save_sam_supervised_figure(class_map, class_names, output_dir):
+    """Save a colour visualisation of the supervised SAM classification map."""
+    from matplotlib.patches import Patch
+
+    rows, cols = class_map.shape
+    rgba = np.ones((rows, cols, 4), dtype=np.float32)
+    rgba[class_map == -1] = [0.78, 0.78, 0.78, 1.0]
+
+    for cls_idx, cls_name in enumerate(class_names):
+        if EXCLUDE_BACKGROUND and cls_name == "Background":
+            continue
+        c = CLASS_COLORS.get(cls_name, "#888888")
+        rgba[class_map == cls_idx] = _hex_to_rgba(c, alpha=1.0)
+
+    fig, ax = plt.subplots(figsize=(8, 12))
+    ax.imshow(rgba, interpolation="nearest")
+    thr_str = (f"{np.degrees(SAM_ANGLE_THRESHOLD):.1f}°"
+               if SAM_ANGLE_THRESHOLD is not None else "none")
+    ax.set_title(
+        "Supervised SAM — AMD Ferro-oxide Lithology\n"
+        f"(angle threshold = {thr_str}, "
+        f"min component = {MIN_COMPONENT_SIZE} px)",
+        fontsize=11, fontweight="bold",
+    )
+    ax.axis("off")
+
+    legend_elements = [
+        Patch(fc=(0.78, 0.78, 0.78), ec="0.5", lw=0.4,
+              label="Unclassified / non-soil"),
+    ]
+    for cls_name in class_names:
+        if EXCLUDE_BACKGROUND and cls_name == "Background":
+            continue
+        c = CLASS_COLORS.get(cls_name, "#888888")
+        legend_elements.append(
+            Patch(fc=c, ec="0.3", lw=0.4, label=cls_name.replace("_", " "))
+        )
+    ax.legend(
+        handles=legend_elements, loc="lower right", fontsize=8,
+        frameon=True, fancybox=False, edgecolor="0.4",
+        handlelength=1.2, handleheight=0.9,
+    )
+
+    plt.tight_layout()
+    fig_path = output_dir / "sam_classification_map.png"
+    plt.savefig(str(fig_path), dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  Classification figure saved: {fig_path.name}")
+
+
+def rf_vs_sam_supervised_comparison(rf_class_map, sam_class_map,
+                                    class_names, soil_mask, output_dir):
+    """Compare the RF and supervised SAM binary AMD_FeOx classifications.
+
+    Both classifiers are trained on identical training pixels and applied to
+    the same soil domain, but use fundamentally different decision rules:
+    RF uses an ensemble of decision trees; supervised SAM uses the minimum
+    spectral angle to a class mean endmember.  Agreement between the two
+    methods is an independent consistency check: high agreement indicates
+    that the spectral separability of the training data is robust across
+    both distance-based and ensemble classification approaches.
+
+    Metrics computed
+    ----------------
+    1. Jaccard IoU — (RF_AMD ∩ SAM_AMD) / (RF_AMD ∪ SAM_AMD)
+    2. Cohen's Kappa — chance-corrected binary agreement in the soil domain
+    3. Spatial agreement map — per-pixel agreement category saved as PNG
+
+    Parameters
+    ----------
+    rf_class_map  : ndarray (rows, cols), int16  — RF output
+    sam_class_map : ndarray (rows, cols), int16  — supervised SAM output
+    class_names   : list of str
+    soil_mask     : ndarray (rows, cols), bool
+    output_dir    : Path  (RF output dir; figure saved here for cross-reference)
+    """
+    print("\n" + "=" * 70)
+    print("RF vs SUPERVISED SAM COMPARISON")
+    print("=" * 70)
+
+    amd_idx = (class_names.index("AMD_FeOx")
+               if "AMD_FeOx" in class_names else 0)
+    rf_amd  = (rf_class_map  == amd_idx)
+    sam_amd = (sam_class_map == amd_idx)
+
+    n_rf  = int(rf_amd.sum())
+    n_sam = int(sam_amd.sum())
+    n_int = int((rf_amd & sam_amd).sum())
+    n_uni = int((rf_amd | sam_amd).sum())
+    rf_only  = n_rf  - n_int
+    sam_only = n_sam - n_int
+
+    jaccard = n_int / n_uni if n_uni > 0 else 0.0
+
+    try:
+        from sklearn.metrics import cohen_kappa_score
+        soil_r, soil_c = np.where(soil_mask)
+        y_rf  = rf_amd[soil_r,  soil_c].astype(np.int32)
+        y_sam = sam_amd[soil_r, soil_c].astype(np.int32)
+        kappa = float(cohen_kappa_score(y_rf, y_sam))
+        kappa_str = f"{kappa:.4f}"
+    except Exception as exc:
+        kappa     = np.nan
+        kappa_str = f"N/A ({exc})"
+
+    print(f"\n  {'Metric':<38} {'Value':>12}")
+    print("  " + "-" * 52)
+    print(f"  {'RF AMD_FeOx pixels':<38} {n_rf:>12,}")
+    print(f"  {'Supervised SAM AMD_FeOx pixels':<38} {n_sam:>12,}")
+    print(f"  {'Both agree (intersection)':<38} {n_int:>12,}")
+    print(f"  {'Either (union)':<38} {n_uni:>12,}")
+    print(f"  {'RF only':<38} {rf_only:>12,}")
+    print(f"  {'SAM supervised only':<38} {sam_only:>12,}")
+    print(f"  {'Jaccard IoU':<38} {jaccard:>12.4f}")
+    print(f"  {'Cohen Kappa (soil domain)':<38} {kappa_str:>12}")
+
+    # ── Save CSV ──────────────────────────────────────────────────────────
+    summary_df = pd.DataFrame([
+        {"metric": "RF_AMD_pixels",       "value": n_rf},
+        {"metric": "SAM_sup_AMD_pixels",  "value": n_sam},
+        {"metric": "Intersection",        "value": n_int},
+        {"metric": "Union",               "value": n_uni},
+        {"metric": "RF_only",             "value": rf_only},
+        {"metric": "SAM_sup_only",        "value": sam_only},
+        {"metric": "Jaccard_IoU",         "value": jaccard},
+        {"metric": "Cohens_Kappa",        "value": kappa},
+    ])
+    csv_path = output_dir / "rf_vs_sam_supervised_comparison.csv"
+    summary_df.to_csv(str(csv_path), index=False)
+    print(f"\n  Comparison CSV saved: {csv_path.name}")
+
+    _save_rf_vs_sam_figure(rf_amd, sam_amd, jaccard, kappa, output_dir)
+
+    return summary_df
+
+
+def _save_rf_vs_sam_figure(rf_amd, sam_amd, jaccard, kappa, output_dir):
+    """Save a spatial agreement map for the RF vs supervised SAM comparison."""
+    from matplotlib.patches import Patch
+
+    rows, cols = rf_amd.shape
+    rf_only  = rf_amd  & ~sam_amd
+    sam_only = sam_amd & ~rf_amd
+    both     = rf_amd  & sam_amd
+
+    rgb_ov = np.ones((rows, cols, 3), dtype=np.float32) * 0.88
+    rgb_ov[rf_only]  = [0.25, 0.55, 0.85]   # blue  — RF only
+    rgb_ov[sam_only] = [0.85, 0.35, 0.20]   # red   — SAM supervised only
+    rgb_ov[both]     = [0.20, 0.72, 0.28]   # green — both agree
+
+    fig, ax = plt.subplots(figsize=(9, 12))
+    fig.suptitle(
+        "RF vs Supervised SAM — AMD_FeOx Spatial Agreement",
+        fontsize=13, fontweight="bold",
+    )
+    ax.imshow(rgb_ov, interpolation="nearest")
+    ax.axis("off")
+
+    legend_elements = [
+        Patch(fc=[0.25, 0.55, 0.85], ec="0.3", lw=0.5,
+              label=f"RF only  ({int(rf_only.sum()):,} px)"),
+        Patch(fc=[0.85, 0.35, 0.20], ec="0.3", lw=0.5,
+              label=f"SAM supervised only  ({int(sam_only.sum()):,} px)"),
+        Patch(fc=[0.20, 0.72, 0.28], ec="0.3", lw=0.5,
+              label=f"Both agree  ({int(both.sum()):,} px)"),
+        Patch(fc=[0.88, 0.88, 0.88], ec="0.4", lw=0.5,
+              label="Neither / non-soil"),
+    ]
+    ax.legend(
+        handles=legend_elements, loc="lower right", fontsize=9,
+        frameon=True, fancybox=False, edgecolor="0.4",
+    )
+
+    kappa_txt = (f"{kappa:.3f}"
+                 if not (isinstance(kappa, float) and np.isnan(kappa))
+                 else "N/A")
+    metrics_txt = (
+        f"Jaccard IoU    : {jaccard:.3f}\n"
+        f"Cohen's Kappa  : {kappa_txt}"
+    )
+    ax.text(
+        0.98, 0.04, metrics_txt,
+        transform=ax.transAxes,
+        fontsize=9, va="bottom", ha="right", family="monospace",
+        bbox=dict(boxstyle="round,pad=0.5",
+                  facecolor="lightyellow", alpha=0.88, edgecolor="0.5"),
+    )
+
+    plt.tight_layout()
+    fig_path = output_dir / "rf_vs_sam_supervised_comparison.png"
+    plt.savefig(str(fig_path), dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  Comparison figure saved: {fig_path.name}")
+
+
+def run_sam_supervised_classification(cube, soil_mask, X, y, class_names,
+                                      wavelengths, output_dir):
+    """Run the supervised SAM classification pipeline.
+
+    Uses the same training pixel data already loaded for the RF classifier:
+    the mean spectrum per class is the SAM endmember, and nearest-endmember
+    assignment is applied to all soil pixels.
+
+    Parameters
+    ----------
+    cube        : ndarray (rows, cols, bands), float32
+    soil_mask   : ndarray (rows, cols), bool
+    X           : ndarray (n_samples, bands), float64  — NaN-imputed spectra
+    y           : ndarray (n_samples,), int            — 0-indexed class labels
+    class_names : list of str
+    wavelengths : ndarray (bands,), float
+    output_dir  : Path
+
+    Returns
+    -------
+    class_map : ndarray (rows, cols), int16
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "=" * 70)
+    print("SUPERVISED CLASSIFICATION — SAM (mean endmember per training class)")
+    print("=" * 70)
+
+    # ── 1. Compute class endmembers ───────────────────────────────────────
+    print("\n1. Computing class endmembers from training pixels...")
+    endmembers = compute_class_endmembers(X, y, class_names)
+
+    # ── 2. Apply SAM nearest-endmember classification ─────────────────────
+    thr_str = (f"{np.degrees(SAM_ANGLE_THRESHOLD):.1f}°"
+               if SAM_ANGLE_THRESHOLD is not None else "none")
+    print(f"\n2. Applying SAM classification (angle threshold = {thr_str})...")
+    class_map, angle_maps, min_angle_map = apply_supervised_sam(
+        cube, soil_mask, endmembers, class_names,
+        angle_threshold=SAM_ANGLE_THRESHOLD,
+    )
+
+    # ── 3. Connected-component noise filter ───────────────────────────────
+    print(f"\n3. Applying connected-component noise filter "
+          f"(< {MIN_COMPONENT_SIZE} px)...")
+    noise_fracs, pre_counts, post_counts = apply_noise_filter(
+        class_map, class_names
+    )
+
+    print(f"\n   Post-filter class pixel counts:")
+    for cls_name in class_names:
+        if EXCLUDE_BACKGROUND and cls_name == "Background":
+            continue
+        pre  = pre_counts.get(cls_name, 0)
+        post = post_counts.get(cls_name, 0)
+        print(f"   {cls_name:<22} {post:>10,}  (was {pre:,})")
+
+    # ── 4. Validation ─────────────────────────────────────────────────────
+    print(f"\n4. Running validation metrics...")
+    validate_sam_supervised_results(
+        class_map, angle_maps, min_angle_map,
+        soil_mask, class_names, noise_fracs,
+        wavelengths, endmembers, output_dir,
+    )
+
+    # ── 5. Save outputs ───────────────────────────────────────────────────
+    print(f"\n5. Saving classification outputs to:\n   {output_dir}")
+    save_sam_supervised_outputs(class_map, angle_maps, class_names, output_dir)
+
+    print("\n" + "=" * 70)
+    print("SUPERVISED SAM CLASSIFICATION COMPLETE")
+    print("=" * 70)
+    print(f"\nOutput directory: {output_dir.resolve()}")
+
+    n_soil_total = int(soil_mask.sum())
+    print("\nClass pixel counts (after noise filter):")
+    print(f"  {'Class':<22} {'Pixels':>10} {'% of soil':>12}")
+    print("  " + "-" * 48)
+    for cls_idx, cls_name in enumerate(class_names):
+        if EXCLUDE_BACKGROUND and cls_name == "Background":
+            continue
+        n = int((class_map == cls_idx).sum())
+        pct = n / n_soil_total * 100 if n_soil_total > 0 else 0.0
+        print(f"  {cls_name:<22} {n:>10,} {pct:>11.2f}%")
+    n_unclass = max(int((class_map == -1).sum() - (~soil_mask).sum()), 0)
+    print(f"  {'Unclassified (soil)':<22} {n_unclass:>10,}")
+    print(f"  {'Total soil pixels':<22} {n_soil_total:>10,}")
+
+    return class_map
+
+
+# =============================================================================
 # OUTPUT SAVING
 # =============================================================================
 
@@ -1272,6 +1901,19 @@ def run_rf_classification(training_npz=None, hdr_file=None, output_dir=None):
     save_rf_outputs(
         class_map, prob_maps, max_prob_map,
         class_names, wavelengths, output_dir
+    )
+
+    # ── 10. Supervised SAM classification (same training pixels) ──────────
+    print(f"\n10. Supervised SAM classification (same training pixels as RF)...")
+    sam_output_dir = Path(SAM_SUPERVISED_OUTPUT_FOLDER)
+    sam_class_map = run_sam_supervised_classification(
+        cube, soil_mask, X, y, class_names, wavelengths, sam_output_dir
+    )
+
+    # ── 11. RF vs supervised SAM comparison ───────────────────────────────
+    print(f"\n11. RF vs supervised SAM agreement comparison...")
+    rf_vs_sam_supervised_comparison(
+        class_map, sam_class_map, class_names, soil_mask, output_dir
     )
 
     print("\n" + "=" * 70)

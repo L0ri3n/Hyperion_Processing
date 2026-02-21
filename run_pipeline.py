@@ -20,14 +20,26 @@ Each stage builds on the previous one:
   training pixels for the binary AMD_FeOx / Background classification.
   Saves training_pixels.npz.  This stage is INTERACTIVE and requires a display.
 
-  Stage 3 — Supervised RF Classification (supervised_classification.py)
-  ---------------------------------------------------------------------
-  Loads training_pixels.npz, trains a binary Random Forest classifier
-  (AMD_FeOx vs Background) with 5-fold stratified cross-validation, applies
-  it to all soil-masked pixels with a 0.60 probability threshold, filters
-  noise components, and runs validation including a multi-metric spatial
-  agreement comparison with the SAM mineral-specific results.
-  Result: broad AMD ferro-oxide lithology footprint
+  Stage 3 — Supervised RF + SAM Classification (supervised_classification.py)
+  ---------------------------------------------------------------------------
+  Loads training_pixels.npz and runs two parallel supervised classifiers on
+  the same training data:
+
+  3a. Random Forest: trains a binary RandomForestClassifier (AMD_FeOx vs
+      Background) with 5-fold stratified cross-validation, applies it to all
+      soil-masked pixels with a 0.60 probability threshold, filters noise
+      components, and validates with Moran's I / feature importances.
+      Cross-method comparison with the SAM mineral-specific results is also
+      computed (Jaccard, Kappa, per-mineral containment).
+
+  3b. Supervised SAM: computes the mean L2-normalised spectrum per training
+      class as the SAM endmember, applies nearest-endmember assignment to all
+      soil pixels, filters noise components, and validates with the same
+      metrics as the RF (Moran's I, noise fraction, min-angle statistics).
+
+  A direct RF vs supervised SAM agreement comparison (Jaccard IoU, Cohen's
+  Kappa, spatial disagreement map) closes the stage.
+  Result: broad AMD ferro-oxide lithology footprint from two classifiers
 
 Usage
 -----
@@ -326,14 +338,17 @@ examples:
         print(f"\n  All {completed} requested stage(s) completed successfully.")
         print(
             "\n  Output locations:"
-            "\n    SAM results  →  amd_mapping/outputs/classifications/"
-            "\n    RF results   →  amd_mapping/outputs/supervised_classification/"
-            "\n    Training px  →  amd_mapping/outputs/training_pixels.npz"
+            "\n    SAM (multi-mineral) →  amd_mapping/outputs/classifications/"
+            "\n    RF supervised       →  amd_mapping/outputs/supervised_classification/"
+            "\n    SAM supervised      →  amd_mapping/outputs/supervised_sam/"
+            "\n    Training px         →  amd_mapping/outputs/training_pixels.npz"
             "\n\n  Key outputs:"
-            "\n    SAM : mineral-specific map     classification_map.hdr"
-            "\n    RF  : AMD_FeOx lithology map   rf_classification_map.hdr"
-            "\n    Cmp : rf_cross_method_comparison.{csv,png}"
-            "\n          rf_per_mineral_containment.csv"
+            "\n    SAM (multi-min) : mineral-specific map    classification_map.hdr"
+            "\n    RF              : AMD_FeOx map            rf_classification_map.hdr"
+            "\n    SAM supervised  : AMD_FeOx map            sam_classification_map.hdr"
+            "\n    RF vs SAM-lib   : rf_cross_method_comparison.{csv,png}"
+            "\n                      rf_per_mineral_containment.csv"
+            "\n    RF vs SAM-sup   : rf_vs_sam_supervised_comparison.{csv,png}"
         )
 
 

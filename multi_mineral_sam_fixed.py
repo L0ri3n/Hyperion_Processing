@@ -1041,21 +1041,13 @@ def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thre
     # =====================================================================
     # Publication-quality visualization
     # =====================================================================
-    from matplotlib.patches import Patch
+    from matplotlib.patches import Patch, Rectangle
     import matplotlib.gridspec as gridspec
 
     mineral_rgb = MINERAL_COLORS
 
-    # Nodata / soil-but-unclassified / background distinction
-    # has_data: any pixel with data (SAM angle < pi means it was not masked out)
-    has_data = np.any(np.abs(
-        np.stack([sam_angles_dict[n] for n in mineral_names], axis=-1)) < np.pi, axis=-1) | soil_mask
-
     # Build RGBA image manually for full control
-    rgba = np.ones((rows, cols, 4), dtype=np.float32)  # white background
-
-    # Layer 1: non-soil valid pixels -> very light gray
-    rgba[has_data & ~soil_mask] = [0.92, 0.92, 0.92, 1.0]
+    rgba = np.ones((rows, cols, 4), dtype=np.float32)  # white background (= non-soil / no-data)
 
     # Layer 2: soil but unclassified -> medium gray
     soil_unclass = soil_mask & (class_map == 0)
@@ -1086,8 +1078,7 @@ def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thre
 
     # Legend
     legend_elements = [
-        Patch(fc='white', ec='0.5', lw=0.4, label='No data'),
-        Patch(fc=(0.92, 0.92, 0.92), ec='0.5', lw=0.4, label='Non-soil (masked)'),
+        Patch(fc='white', ec='0.5', lw=0.4, label='Non-soil'),
         Patch(fc=(0.75, 0.75, 0.75), ec='0.5', lw=0.4, label='Soil (unclassified)'),
     ]
     for idx, name in enumerate(mineral_names):
@@ -1101,6 +1092,29 @@ def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thre
                     frameon=True, fancybox=False, edgecolor='0.4',
                     handlelength=1.0, handleheight=0.8,
                     borderpad=0.4, labelspacing=0.35)
+
+    # --- North arrow (upper-right, axes coordinates; image is north-up) ---
+    ax_class.annotate('', xy=(0.93, 0.96), xycoords='axes fraction',
+                      xytext=(0.93, 0.86), textcoords='axes fraction',
+                      arrowprops=dict(arrowstyle='->', color='black', lw=1.5))
+    ax_class.text(0.93, 0.97, 'N', transform=ax_class.transAxes,
+                  ha='center', va='bottom', fontsize=8, fontweight='bold', color='black')
+
+    # --- 5 km scale bar (axes coordinates, above legend; Hyperion = 30 m/pixel) ---
+    _PIXEL_M    = 30.0
+    _scale_px   = 5000.0 / _PIXEL_M          # ~167 px in data units
+    _scale_xfrac = _scale_px / cols           # bar width as fraction of axes width
+    # Right-align at x=0.97, just above the legend box (~y=0.35 from bottom)
+    _sb_x0 = 0.97 - _scale_xfrac
+    _sb_y  = 0.35
+    _sb_h  = 0.007                            # bar thickness in axes fraction
+    ax_class.add_patch(Rectangle((_sb_x0, _sb_y), _scale_xfrac, _sb_h,
+                                 transform=ax_class.transAxes,
+                                 color='black', zorder=5, clip_on=False))
+    ax_class.text(_sb_x0 + _scale_xfrac / 2, _sb_y + _sb_h * 2.5,
+                  '5 km', ha='center', va='bottom',
+                  transform=ax_class.transAxes,
+                  fontsize=6.5, color='black', zorder=5)
 
     # (b) Minimum SAM angle — soil pixels only
     ax_sam = fig.add_subplot(gs[0, 1])
@@ -1146,6 +1160,11 @@ def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thre
     tbl.auto_set_font_size(False)
     tbl.set_fontsize(6.5)
     tbl.scale(1.0, 1.2)
+    # Widen the Mineral column so long names (e.g. "Schwertmannite") are not clipped
+    _col_widths = [0.30, 0.175, 0.155, 0.20, 0.09]   # sum ~0.92 of axes width
+    for _r in range(len(mineral_names) + 1):          # +1 for header row
+        for _c, _w in enumerate(_col_widths):
+            tbl[_r, _c].set_width(_w)
 
     # Style header row
     for j in range(len(col_labels)):
