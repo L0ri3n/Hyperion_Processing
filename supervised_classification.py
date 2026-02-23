@@ -1,46 +1,46 @@
 """
-supervised_classification.py — Random Forest AMD Ferro-oxide Lithology Classifier
-==================================================================================
+supervised_classification.py — Supervised SAM AMD Ferro-oxide Lithology Classifier
+====================================================================================
 
-Binary supervised classification of AMD ferro-oxide lithology using a Random
-Forest trained on manually selected training pixels (AMD_FeOx vs. Background).
+Binary supervised classification of AMD ferro-oxide lithology using a Spectral
+Angle Mapper (SAM) trained on manually selected training pixels (AMD_FeOx vs.
+Background).  Image-derived endmembers (mean spectrum per training class,
+L2-normalised) replace the USGS library references used in the primary
+multi-mineral SAM workflow; the angular similarity decision rule is otherwise
+identical.
 
-The classifier identifies the broad AMD-altered zone — the lithological unit
-that hosts all Fe³⁺ secondary minerals (goethite, hematite, jarosite, etc.)
-collectively — rather than discriminating individual mineral species.  This
-produces a more statistically robust, spatially coherent result than the SAM
-mineral-specific approach, at the cost of spectral specificity.
+Purpose
+-------
+Internal cross-validation of the primary library-driven SAM workflow.
+Divergences between the two SAM outputs reflect the spectral distance between
+USGS library references and actual Rio Tinto scene conditions (mixed pixels,
+atmospheric residuals at 30 m resolution), not algorithmic differences — both
+methods use the same SAM angular similarity logic.
 
 Pipeline overview
 -----------------
 1. Load training pixels (.npz) and reflectance cube (ENVI .hdr).
 2. Extract spectral feature vectors (all valid bands) and assemble a labelled
    dataset with classes [AMD_FeOx, Background].
-3. Train RandomForestClassifier(n_estimators=200, class_weight='balanced',
-   random_state=42) with 5-fold stratified cross-validation (balanced
-   accuracy reported per fold).
-4. Apply the trained classifier to all soil-masked pixels using predict_proba;
-   predictions with max AMD_FeOx probability < 0.60 are rejected as uncertain.
-5. Reconstruct the full-scene AMD_FeOx mask and probability map.
-6. Apply a connected-component noise filter (components < 4 pixels removed),
-   matching the post-processing used in the SAM workflow.
-7. Validate results:
+3. Compute the mean L2-normalised spectrum per training class as the SAM
+   endmember.
+4. Apply nearest-endmember SAM classification to all soil-masked pixels.
+5. Apply a connected-component noise filter (components < 4 pixels removed),
+   matching the post-processing used in the library SAM workflow.
+6. Validate results:
    (a) Noise fraction (pixels removed by size filter / pre-filter total).
    (b) Moran's I spatial clustering of the AMD_FeOx binary mask within the
-       soil domain (Queen contiguity, same implementation as the SAM workflow).
-   (c) MDI feature importances with corresponding band wavelengths.
-   (d) Mean and std of AMD_FeOx posterior probability for accepted pixels.
-8. Cross-method comparison (RF AMD lithology vs. SAM mineral map):
-   The two results are complementary, not directly comparable class-to-class.
-   The comparison aggregates all SAM mineral detections into a single binary
-   'SAM AMD' mask and computes:
-     - Jaccard IoU  (RF_AMD ∩ SAM_union) / (RF_AMD ∪ SAM_union)
-     - Cohen's Kappa  (binary agreement within soil domain, chance-corrected)
-     - SAM recall     fraction of SAM pixels captured by RF AMD zone
-     - RF efficiency  fraction of RF AMD pixels confirmed by ≥1 SAM mineral
-     - Per-mineral containment  fraction of each SAM mineral inside RF AMD zone
-9. Save: classification map as GeoTIFF + ENVI, probability map as ENVI,
-   all validation tables as CSV, feature importance and comparison plots as PNG.
+       soil domain (Queen contiguity, same implementation as the library SAM).
+   (c) Min-angle statistics (mean and std of minimum SAM angle per class).
+7. Cross-method comparison (supervised SAM AMD zone vs. library SAM mineral map):
+   - Jaccard IoU  (sup_SAM_AMD ∩ lib_SAM_union) / (sup_SAM_AMD ∪ lib_SAM_union)
+   - Cohen's Kappa  (binary agreement within soil domain, chance-corrected)
+   - Library SAM recall in supervised SAM zone
+   - Supervised SAM efficiency (lib-SAM-confirmed fraction)
+   - Per-mineral containment  fraction of each library SAM mineral inside
+     the supervised SAM AMD zone
+8. Save: classification map as GeoTIFF + ENVI, angle maps as ENVI,
+   all validation tables as CSV, comparison figures as PNG.
 
 Assumptions
 -----------
@@ -54,8 +54,8 @@ Assumptions
   with a warning, and the pipeline still completes successfully.
 * GeoTIFF export requires rasterio.  If not installed the file is skipped and
   only the ENVI format is written.
-* The SAM classification map is expected at SAM_CLASS_MAP_FILE (defined below).
-  If absent the cross-method comparison section is skipped gracefully.
+* The library SAM classification map is expected at SAM_CLASS_MAP_FILE (defined
+  below).  If absent the cross-method comparison section is skipped gracefully.
 """
 
 import numpy as np
@@ -83,28 +83,17 @@ HDR_FILE = str(
     / "EO1H2020342013284110KF_reflectance.hdr"
 )
 
-# SAM classification map (ENVI .hdr) for cross-method comparison.
+# Library SAM classification map (ENVI .hdr) for cross-method comparison.
 # Produced by multi_mineral_sam_fixed.py → save_envi_classification().
 SAM_CLASS_MAP_FILE = str(
     BASE_DIR / "amd_mapping" / "outputs" / "classifications"
     / "classification_map.hdr"
 )
 
-# All output files go here
+# All output files go here (supervised SAM results)
 OUTPUT_FOLDER = str(
-    BASE_DIR / "amd_mapping" / "outputs" / "supervised_classification"
+    BASE_DIR / "amd_mapping" / "outputs" / "supervised_sam"
 )
-
-# Random Forest hyper-parameters (fixed by specification)
-RF_N_ESTIMATORS   = 200
-RF_CLASS_WEIGHT   = "balanced"
-RF_RANDOM_STATE   = 42
-
-# Number of stratified k-fold cross-validation splits
-CV_FOLDS = 5
-
-# Minimum max-class probability to accept a prediction (else → Unclassified)
-PROB_THRESHOLD = 0.60
 
 # Connected components smaller than this are removed as noise.
 # Matches MIN_COMPONENT_SIZE in multi_mineral_sam_fixed.py.
@@ -130,10 +119,8 @@ CLASS_COLORS = {
 # Set to e.g. np.pi / 4 (≈ 45°) to reject spectrally ambiguous pixels.
 SAM_ANGLE_THRESHOLD = None
 
-# Output folder for supervised SAM results (parallel to OUTPUT_FOLDER)
-SAM_SUPERVISED_OUTPUT_FOLDER = str(
-    BASE_DIR / "amd_mapping" / "outputs" / "supervised_sam"
-)
+# Alias kept for any code that still references the old constant name.
+SAM_SUPERVISED_OUTPUT_FOLDER = OUTPUT_FOLDER
 
 # =============================================================================
 # HELPERS
@@ -371,148 +358,8 @@ def load_training_data(npz_path, cube, soil_mask, wavelengths):
 
 
 # =============================================================================
-# TRAINING AND CROSS-VALIDATION
+# POST-PROCESSING
 # =============================================================================
-
-
-def train_with_cross_validation(X, y, class_names):
-    """Train a RandomForestClassifier with 5-fold stratified cross-validation.
-
-    Reports balanced accuracy per fold and the mean ± std across folds.
-    The final classifier is retrained on the full training set.
-
-    Parameters
-    ----------
-    X : ndarray (n_samples, n_bands), float64
-    y : ndarray (n_samples,), int
-    class_names : list of str
-
-    Returns
-    -------
-    rf : fitted RandomForestClassifier
-    cv_scores : ndarray (CV_FOLDS,), float — balanced accuracy per fold
-    """
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.model_selection import StratifiedKFold
-    from sklearn.metrics import balanced_accuracy_score
-
-    rf_params = dict(
-        n_estimators=RF_N_ESTIMATORS,
-        class_weight=RF_CLASS_WEIGHT,
-        random_state=RF_RANDOM_STATE,
-        n_jobs=-1,
-    )
-
-    print(f"\n  Random Forest hyper-parameters: {rf_params}")
-    print(f"  Cross-validation: {CV_FOLDS}-fold stratified\n")
-
-    skf = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=42)
-    cv_scores = []
-
-    print(f"  {'Fold':>6} {'Balanced Accuracy':>20}")
-    print("  " + "-" * 28)
-
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, y), start=1):
-        rf_fold = RandomForestClassifier(**rf_params)
-        rf_fold.fit(X[train_idx], y[train_idx])
-        y_pred = rf_fold.predict(X[val_idx])
-        ba = balanced_accuracy_score(y[val_idx], y_pred)
-        cv_scores.append(ba)
-        print(f"  {fold_idx:>6} {ba:>20.4f}")
-
-    cv_scores = np.array(cv_scores)
-    print("  " + "-" * 28)
-    print(f"  {'Mean':>6} {cv_scores.mean():>20.4f}")
-    print(f"  {'± Std':>6} {cv_scores.std():>20.4f}")
-
-    # Retrain on the full set for final prediction
-    print("\n  Retraining on full training set...")
-    rf = RandomForestClassifier(**rf_params)
-    rf.fit(X, y)
-    print("  Done.")
-
-    return rf, cv_scores
-
-
-# =============================================================================
-# CLASSIFICATION AND POST-PROCESSING
-# =============================================================================
-
-
-def apply_classifier(rf, cube, soil_mask, class_names):
-    """Apply the trained RF to all soil-masked pixels.
-
-    Pixels where max class probability < PROB_THRESHOLD are labelled as
-    Unclassified (code = -1) to reject spectrally ambiguous predictions.
-
-    Parameters
-    ----------
-    rf : fitted RandomForestClassifier
-    cube : ndarray (rows, cols, bands), float32
-    soil_mask : ndarray (rows, cols), bool
-    class_names : list of str
-
-    Returns
-    -------
-    class_map : ndarray (rows, cols), int16
-        Class codes: -1 = non-soil or rejected; 0..n-1 = class index.
-    prob_maps : ndarray (rows, cols, n_classes), float32
-        Per-class posterior probabilities (soil pixels only; others = 0).
-    max_prob_map : ndarray (rows, cols), float32
-        Maximum probability across all classes at each soil pixel.
-    """
-    rows, cols, bands = cube.shape
-    n_classes = len(class_names)
-
-    soil_r, soil_c = np.where(soil_mask)
-    n_soil = len(soil_r)
-    print(f"\n  Classifying {n_soil:,} soil pixels...")
-
-    # Extract and impute soil spectra
-    soil_spectra = cube[soil_r, soil_c, :].astype(np.float64)
-    _impute_nan_bands(soil_spectra)
-
-    # Predict in batches to control peak memory usage (1 000 000 px / batch)
-    batch_size = 1_000_000
-    probas_all  = np.zeros((n_soil, n_classes), dtype=np.float32)
-
-    for start in range(0, n_soil, batch_size):
-        end = min(start + batch_size, n_soil)
-        probas_all[start:end] = rf.predict_proba(
-            soil_spectra[start:end]
-        ).astype(np.float32)
-
-    max_proba  = probas_all.max(axis=1)
-    pred_class = probas_all.argmax(axis=1).astype(np.int16)
-
-    # Reject low-confidence predictions
-    pred_class[max_proba < PROB_THRESHOLD] = -1
-
-    n_rejected = int((max_proba < PROB_THRESHOLD).sum())
-    n_accepted = int((max_proba >= PROB_THRESHOLD).sum())
-    print(f"  Accepted predictions (prob ≥ {PROB_THRESHOLD:.2f}): {n_accepted:,} "
-          f"({n_accepted / n_soil * 100:.1f}%)")
-    print(f"  Rejected predictions (prob < {PROB_THRESHOLD:.2f}): {n_rejected:,} "
-          f"({n_rejected / n_soil * 100:.1f}%)")
-
-    # Reconstruct full-scene arrays
-    class_map = np.full((rows, cols), -1, dtype=np.int16)
-    class_map[soil_r, soil_c] = pred_class
-
-    prob_maps = np.zeros((rows, cols, n_classes), dtype=np.float32)
-    prob_maps[soil_r, soil_c] = probas_all
-
-    max_prob_map = np.zeros((rows, cols), dtype=np.float32)
-    max_prob_map[soil_r, soil_c] = max_proba
-
-    # Optionally relabel Background predictions as Unclassified
-    if EXCLUDE_BACKGROUND and "Background" in class_names:
-        bg_idx = class_names.index("Background")
-        class_map[class_map == bg_idx] = -1
-        print(f"  Background class (idx {bg_idx}) relabelled to Unclassified "
-              f"in output map.")
-
-    return class_map, prob_maps, max_prob_map
 
 
 def apply_noise_filter(class_map, class_names):
@@ -576,468 +423,7 @@ def apply_noise_filter(class_map, class_names):
 
 
 # =============================================================================
-# VALIDATION
-# =============================================================================
-
-
-def validate_rf_results(class_map, prob_maps, max_prob_map,
-                        soil_mask, cube, wavelengths, class_names,
-                        rf, noise_fracs, output_dir):
-    """Compute and save validation metrics for the RF classification.
-
-    Metrics computed per class
-    --------------------------
-    (a) Noise fraction — fraction of pixels removed by the size filter.
-        Mirrors the connected-component metric in validate_sam_results().
-    (b) Moran's I — spatial clustering of each binary class mask within the
-        soil domain, using Queen (8-neighbour) row-standardised weights.
-        Requires esda + libpysal; skipped gracefully if absent.
-    (c) MDI feature importances — mean decrease in impurity per band,
-        plotted against wavelength and saved as PNG + CSV.
-    (d) Max-class probability statistics — mean and std of max_proba per
-        mineral class for accepted pixels; low mean → classifier uncertainty.
-
-    Parameters
-    ----------
-    class_map : ndarray (rows, cols), int16
-    prob_maps : ndarray (rows, cols, n_classes), float32
-    max_prob_map : ndarray (rows, cols), float32
-    soil_mask : ndarray (rows, cols), bool
-    cube : ndarray (rows, cols, bands), float32  (unused here but kept for
-           signature parity with validate_sam_results)
-    wavelengths : ndarray (bands,), float
-    class_names : list of str
-    rf : fitted RandomForestClassifier
-    noise_fracs : dict {class_name -> float}
-    output_dir : Path
-
-    Returns
-    -------
-    val_df : pd.DataFrame — validation metrics table
-    """
-    # ── optional spatial stats dependencies ──────────────────────────────
-    try:
-        import libpysal.weights as lps_weights
-        from esda import Moran
-        HAS_ESDA = True
-    except ImportError:
-        HAS_ESDA = False
-        print("  [validation] WARNING: esda/libpysal not found — "
-              "Moran's I skipped.")
-
-    val_dir = output_dir / "validation"
-    val_dir.mkdir(parents=True, exist_ok=True)
-
-    soil_r, soil_c = np.where(soil_mask)
-
-    print("\n" + "=" * 70)
-    print("RF VALIDATION METRICS")
-    print("=" * 70)
-
-    # ── (c) MDI feature importances ──────────────────────────────────────
-    importances = rf.feature_importances_            # (n_bands,)
-    imp_df = pd.DataFrame({
-        "band":       np.arange(len(importances)),
-        "wavelength": wavelengths,
-        "importance": importances,
-    }).sort_values("importance", ascending=False)
-    imp_df.to_csv(val_dir / "rf_feature_importances.csv", index=False)
-
-    # Feature importance figure
-    n_top = min(30, len(importances))
-    top_df = imp_df.head(n_top)
-
-    fig, ax = plt.subplots(figsize=(14, 5))
-    bar_colors = plt.cm.plasma(
-        (top_df["importance"].values - top_df["importance"].min()) /
-        (top_df["importance"].max() - top_df["importance"].min() + 1e-10)
-    )
-    ax.bar(range(n_top), top_df["importance"].values, color=bar_colors)
-    ax.set_xticks(range(n_top))
-    ax.set_xticklabels(
-        [f"{w:.0f}" for w in top_df["wavelength"].values],
-        rotation=55, ha="right", fontsize=8
-    )
-    ax.set_xlabel("Wavelength (nm)", fontsize=11)
-    ax.set_ylabel("MDI Importance", fontsize=11)
-    ax.set_title(
-        f"Random Forest Feature Importances (MDI) — Top {n_top} Bands",
-        fontsize=12, fontweight="bold"
-    )
-    ax.grid(True, axis="y", alpha=0.3)
-    plt.tight_layout()
-    fig_path = val_dir / "rf_feature_importances.png"
-    plt.savefig(str(fig_path), dpi=200, bbox_inches="tight")
-    plt.close()
-    print(f"\n  Feature importance plot saved: {fig_path.name}")
-
-    # ── Per-class metrics ─────────────────────────────────────────────────
-    cw = (22, 10, 10, 10, 10, 10, 18)
-    header = (
-        f"  {'Class':<{cw[0]}} "
-        f"{'n_px':>{cw[1]}} "
-        f"{'NoiseFrac':>{cw[2]}} "
-        f"{'MeanMaxP':>{cw[3]}} "
-        f"{'StdMaxP':>{cw[4]}} "
-        f"{'Moran_I':>{cw[5]}} "
-        f"{'Significance':<{cw[6]}}"
-    )
-    print(f"\n{header}")
-    print("  " + "-" * (sum(cw) + len(cw) - 1))
-
-    records = []
-
-    for cls_idx, cls_name in enumerate(class_names):
-        if EXCLUDE_BACKGROUND and cls_name == "Background":
-            continue
-
-        binary = (class_map == cls_idx)
-        n_px   = int(binary.sum())
-
-        noise_frac = noise_fracs.get(cls_name, np.nan)
-
-        # (d) Max-class probability stats for accepted pixels of this class
-        if n_px > 0:
-            accepted_proba = max_prob_map[binary]
-            mean_mp = float(accepted_proba.mean())
-            std_mp  = float(accepted_proba.std())
-        else:
-            mean_mp = np.nan
-            std_mp  = np.nan
-
-        # (b) Moran's I
-        if HAS_ESDA and n_px >= 2:
-            mi_I, mi_z, mi_p, mi_sig = _compute_morans_i(
-                binary, soil_r, soil_c, lps_weights, Moran
-            )
-        else:
-            mi_I, mi_z, mi_p = np.nan, np.nan, np.nan
-            mi_sig = "skipped (esda missing or n=0)"
-
-        nf_str = f"{noise_frac:.3f}" if not np.isnan(noise_frac) else "N/A"
-        mm_str = f"{mean_mp:.3f}"    if not np.isnan(mean_mp)    else "N/A"
-        ms_str = f"{std_mp:.3f}"     if not np.isnan(std_mp)     else "N/A"
-        mi_str = f"{mi_I:.4f}"       if not np.isnan(mi_I)       else "N/A"
-
-        print(
-            f"  {cls_name:<{cw[0]}} "
-            f"{n_px:>{cw[1]},} "
-            f"{nf_str:>{cw[2]}} "
-            f"{mm_str:>{cw[3]}} "
-            f"{ms_str:>{cw[4]}} "
-            f"{mi_str:>{cw[5]}} "
-            f"{mi_sig:<{cw[6]}}"
-        )
-
-        records.append({
-            "Class":          cls_name,
-            "n_pixels":       n_px,
-            "noise_frac":     noise_frac,
-            "mean_max_prob":  mean_mp,
-            "std_max_prob":   std_mp,
-            "moran_I":        mi_I,
-            "moran_z":        mi_z,
-            "moran_p":        mi_p,
-            "moran_sig":      mi_sig,
-        })
-
-    val_df = pd.DataFrame(records)
-    val_csv = output_dir / "rf_validation_metrics.csv"
-    val_df.to_csv(str(val_csv), index=False)
-    print(f"\n  Validation metrics saved: {val_csv.name}")
-
-    return val_df
-
-
-# =============================================================================
-# CROSS-METHOD COMPARISON (RF AMD lithology vs SAM mineral map)
-# =============================================================================
-
-
-def cross_method_comparison(class_map, class_names, soil_mask, output_dir):
-    """Compare the RF AMD_FeOx lithology map against the aggregate SAM mineral map.
-
-    The RF classifies a broad AMD ferro-oxide lithological unit; SAM classifies
-    specific constituent minerals (goethite, hematite, jarosite, etc.) within
-    that unit.  A direct class-to-class comparison is not meaningful because the
-    two outputs operate at different levels of spectral specificity.
-
-    Instead, all SAM mineral detections are aggregated into a single binary
-    'SAM AMD' mask, and the following spatial agreement metrics are computed:
-
-    1. **Jaccard IoU** — (RF_AMD ∩ SAM_union) / (RF_AMD ∪ SAM_union)
-       Measures the spatial overlap between the two binary AMD footprints.
-       Expected to be moderate (0.2–0.6): RF captures the full lithological
-       unit while SAM only detects pixels with strong mineral signatures.
-
-    2. **Cohen's Kappa** — chance-corrected binary agreement within the soil
-       domain (both maps treated as binary AMD-present / not-present).
-       Kappa > 0.4 suggests substantial agreement; the SAM map is used as
-       reference since it provides mineral-level ground truth.
-
-    3. **SAM recall within RF** — fraction of SAM-union pixels inside RF_AMD.
-       High recall (→ 1.0) means the RF AMD zone successfully encompasses all
-       SAM-detected mineral occurrences, as expected from the hypothesis that
-       AMD_FeOx is the hosting lithological unit.
-
-    4. **RF efficiency (SAM-confirmed)** — fraction of RF_AMD pixels that
-       contain ≥ 1 SAM mineral detection.  Lower values are expected because
-       RF captures the full mineralised zone, not only the spectral peaks.
-
-    5. **Per-mineral SAM containment** — fraction of each SAM mineral inside
-       the RF AMD zone.  All minerals should show high containment if RF
-       correctly delineates the host lithology.
-
-    A figure is saved alongside the CSVs showing the spatial overlap map and
-    the per-mineral containment bar chart.
-
-    Parameters
-    ----------
-    class_map   : ndarray (rows, cols), int16  — RF classification map
-    class_names : list of str                  — ordered RF class names
-    soil_mask   : ndarray (rows, cols), bool   — valid soil pixels
-    output_dir  : Path
-
-    Returns
-    -------
-    summary_df : pd.DataFrame or None
-    """
-    sam_hdr = Path(SAM_CLASS_MAP_FILE)
-    if not sam_hdr.exists():
-        print(
-            f"\n  [cross-method] SAM classification map not found at:\n"
-            f"    {sam_hdr}\n"
-            "  Skipping cross-method comparison.  Run multi_mineral_sam_fixed.py "
-            "first."
-        )
-        return None
-
-    print("\n" + "=" * 70)
-    print("CROSS-METHOD COMPARISON  (RF AMD Lithology vs SAM Mineral Map)")
-    print("=" * 70)
-
-    sam_img = sp.open_image(str(sam_hdr))
-    sam_map = np.squeeze(sam_img.load()[:, :, 0]).astype(np.int32)
-
-    # ENVI metadata: 'class names' = ['Unclassified', mineral_1, ...]
-    sam_class_meta = sam_img.metadata.get("class names", [])
-    sam_mineral_names = list(sam_class_meta[1:]) if len(sam_class_meta) > 1 else []
-    print(f"\n  SAM mineral classes ({len(sam_mineral_names)}): {sam_mineral_names}")
-
-    # ── RF AMD binary mask ────────────────────────────────────────────────
-    if "AMD_FeOx" in class_names:
-        amd_idx = class_names.index("AMD_FeOx")
-    else:
-        # Fallback: first non-Background class
-        amd_idx = next(
-            (i for i, n in enumerate(class_names) if n.lower() != "background"), 0
-        )
-        print(f"  WARNING: 'AMD_FeOx' not found in class_names — using "
-              f"class index {amd_idx} ({class_names[amd_idx]}) as AMD mask.")
-
-    rf_amd  = (class_map == amd_idx)
-    sam_any = (sam_map > 0)          # union of all SAM-classified minerals
-
-    n_rf  = int(rf_amd.sum())
-    n_sam = int(sam_any.sum())
-    n_intersection = int((rf_amd & sam_any).sum())
-    n_union        = int((rf_amd | sam_any).sum())
-
-    jaccard      = n_intersection / n_union        if n_union > 0 else 0.0
-    sam_recall   = n_intersection / n_sam          if n_sam  > 0 else 0.0
-    rf_efficiency = n_intersection / n_rf          if n_rf   > 0 else 0.0
-
-    # ── Cohen's Kappa (soil domain only) ─────────────────────────────────
-    # Restricting to soil avoids inflating kappa with the large
-    # non-soil background (both maps trivially agree on 0 there).
-    try:
-        from sklearn.metrics import cohen_kappa_score
-        soil_r, soil_c = np.where(soil_mask)
-        y_rf  = rf_amd[soil_r, soil_c].astype(np.int32)
-        y_sam = sam_any[soil_r, soil_c].astype(np.int32)
-        kappa = float(cohen_kappa_score(y_sam, y_rf))
-        kappa_str = f"{kappa:.4f}"
-    except ImportError:
-        kappa     = np.nan
-        kappa_str = "N/A (sklearn missing)"
-    except Exception as exc:
-        kappa     = np.nan
-        kappa_str = f"N/A ({exc})"
-
-    # ── Print global summary ──────────────────────────────────────────────
-    print(f"\n  {'Metric':<35} {'Value':>12}")
-    print("  " + "-" * 49)
-    print(f"  {'RF AMD_FeOx pixels':<35} {n_rf:>12,}")
-    print(f"  {'SAM pixels (all minerals, union)':<35} {n_sam:>12,}")
-    print(f"  {'Intersection':<35} {n_intersection:>12,}")
-    print(f"  {'Union':<35} {n_union:>12,}")
-    print(f"  {'Jaccard IoU':<35} {jaccard:>12.4f}")
-    label_kappa = "Cohen's Kappa (soil domain)"
-    print(f"  {label_kappa:<35} {kappa_str:>12}")
-    print(f"  {'SAM recall within RF (%)':<35} {sam_recall * 100:>11.1f}%")
-    print(f"  {'RF efficiency / SAM-confirmed (%)':<35} {rf_efficiency * 100:>11.1f}%")
-
-    # ── Per-mineral containment ───────────────────────────────────────────
-    per_mineral = []
-    print(f"\n  Per-SAM-mineral containment within RF AMD_FeOx zone:")
-    print(f"  {'SAM Mineral':<28} {'n_SAM':>8} {'n_in_RF':>8} {'% in RF':>8}")
-    print("  " + "-" * 56)
-    for i, mineral in enumerate(sam_mineral_names, start=1):
-        mineral_mask = (sam_map == i)
-        n_mineral    = int(mineral_mask.sum())
-        n_in_rf      = int((mineral_mask & rf_amd).sum())
-        pct          = n_in_rf / n_mineral * 100 if n_mineral > 0 else 0.0
-        print(f"  {mineral:<28} {n_mineral:>8,} {n_in_rf:>8,} {pct:>7.1f}%")
-        per_mineral.append({
-            "SAM_mineral":   mineral,
-            "n_SAM":         n_mineral,
-            "n_in_RF_AMD":   n_in_rf,
-            "pct_in_RF_AMD": pct,
-        })
-
-    # ── Save CSVs ─────────────────────────────────────────────────────────
-    summary_records = [
-        {"metric": "RF_AMD_pixels",        "value": n_rf},
-        {"metric": "SAM_union_pixels",     "value": n_sam},
-        {"metric": "Intersection",         "value": n_intersection},
-        {"metric": "Union",                "value": n_union},
-        {"metric": "Jaccard_IoU",          "value": jaccard},
-        {"metric": "Cohens_Kappa",         "value": kappa},
-        {"metric": "SAM_recall_in_RF",     "value": sam_recall},
-        {"metric": "RF_efficiency_SAMconf","value": rf_efficiency},
-    ]
-    summary_df  = pd.DataFrame(summary_records)
-    summary_csv = output_dir / "rf_cross_method_comparison.csv"
-    summary_df.to_csv(str(summary_csv), index=False)
-
-    per_min_df  = pd.DataFrame(per_mineral)
-    per_min_csv = output_dir / "rf_per_mineral_containment.csv"
-    per_min_df.to_csv(str(per_min_csv), index=False)
-
-    print(f"\n  Summary metrics saved : {summary_csv.name}")
-    print(f"  Per-mineral CSV saved : {per_min_csv.name}")
-
-    # ── Comparison figure ─────────────────────────────────────────────────
-    _save_comparison_figure(
-        rf_amd, sam_any, per_mineral,
-        jaccard, kappa, sam_recall, rf_efficiency,
-        output_dir,
-    )
-
-    return summary_df
-
-
-def _save_comparison_figure(rf_amd, sam_any, per_mineral,
-                            jaccard, kappa, sam_recall, rf_efficiency,
-                            output_dir):
-    """Save a two-panel spatial agreement figure for the cross-method comparison.
-
-    Left panel  — spatial overlap map coded by agreement category.
-    Right panel — per-SAM-mineral containment bar chart + global metrics box.
-    """
-    from matplotlib.patches import Patch
-
-    rows, cols = rf_amd.shape
-
-    # ── Spatial overlap categories ────────────────────────────────────────
-    rf_only  = rf_amd & ~sam_any
-    sam_only = sam_any & ~rf_amd
-    both     = rf_amd & sam_any
-
-    # Build RGB image
-    rgb_ov = np.ones((rows, cols, 3), dtype=np.float32) * 0.88  # neutral grey
-    rgb_ov[rf_only]  = [0.25, 0.55, 0.85]   # blue  — RF AMD only
-    rgb_ov[sam_only] = [0.90, 0.55, 0.10]   # orange — SAM only
-    rgb_ov[both]     = [0.20, 0.72, 0.28]   # green  — agreement
-
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-    fig.suptitle(
-        "RF AMD Ferro-oxide Lithology vs. SAM Mineral Map — Spatial Agreement",
-        fontsize=13, fontweight="bold",
-    )
-
-    # ── Left: overlap map ─────────────────────────────────────────────────
-    ax_map = axes[0]
-    ax_map.imshow(rgb_ov, interpolation="nearest")
-    ax_map.set_title("Spatial Overlap Map", fontsize=11, fontweight="bold")
-    ax_map.axis("off")
-    legend_elements = [
-        Patch(fc=[0.25, 0.55, 0.85], ec="0.3", lw=0.5,
-              label=f"RF AMD_FeOx only  ({int(rf_only.sum()):,} px)"),
-        Patch(fc=[0.90, 0.55, 0.10], ec="0.3", lw=0.5,
-              label=f"SAM minerals only  ({int(sam_only.sum()):,} px)"),
-        Patch(fc=[0.20, 0.72, 0.28], ec="0.3", lw=0.5,
-              label=f"Both agree  ({int(both.sum()):,} px)"),
-        Patch(fc=[0.88, 0.88, 0.88], ec="0.4", lw=0.5,
-              label="Neither / non-soil"),
-    ]
-    ax_map.legend(
-        handles=legend_elements, loc="lower right", fontsize=8.5,
-        frameon=True, fancybox=False, edgecolor="0.4",
-    )
-
-    # ── Right: per-mineral containment bar chart ──────────────────────────
-    ax_bar = axes[1]
-    minerals = [d["SAM_mineral"] for d in per_mineral]
-    pcts     = [d["pct_in_RF_AMD"] for d in per_mineral]
-
-    if pcts:
-        bar_colors = plt.cm.RdYlGn(np.array(pcts) / 100.0)
-        bars = ax_bar.barh(
-            minerals, pcts,
-            color=bar_colors, edgecolor="0.4", linewidth=0.6,
-        )
-        ax_bar.axvline(
-            100, color="0.4", linestyle="--", linewidth=0.9, alpha=0.7,
-            label="100 % containment",
-        )
-        ax_bar.set_xlim(0, 118)
-        for bar, pct in zip(bars, pcts):
-            ax_bar.text(
-                min(pct + 1.2, 114),
-                bar.get_y() + bar.get_height() / 2,
-                f"{pct:.1f}%",
-                va="center", fontsize=8.5,
-            )
-    else:
-        ax_bar.text(0.5, 0.5, "No SAM minerals found",
-                    ha="center", va="center", transform=ax_bar.transAxes)
-
-    ax_bar.set_xlabel("% of SAM mineral pixels inside RF AMD_FeOx zone", fontsize=9)
-    ax_bar.set_title(
-        "Per-mineral SAM containment in RF AMD zone\n"
-        "(high % = RF AMD zone encloses the SAM mineral detections)",
-        fontsize=10, fontweight="bold",
-    )
-    ax_bar.grid(True, axis="x", alpha=0.3)
-
-    # Global metrics text box
-    kappa_txt = f"{kappa:.3f}" if not (isinstance(kappa, float) and np.isnan(kappa)) else "N/A"
-    metrics_txt = (
-        f"Jaccard IoU       : {jaccard:.3f}\n"
-        f"Cohen's Kappa     : {kappa_txt}\n"
-        f"SAM recall in RF  : {sam_recall * 100:.1f}%\n"
-        f"RF efficiency     : {rf_efficiency * 100:.1f}%"
-    )
-    ax_bar.text(
-        0.98, 0.04, metrics_txt,
-        transform=ax_bar.transAxes,
-        fontsize=8.5, va="bottom", ha="right", family="monospace",
-        bbox=dict(
-            boxstyle="round,pad=0.5",
-            facecolor="lightyellow", alpha=0.88, edgecolor="0.5",
-        ),
-    )
-
-    plt.tight_layout()
-    fig_path = output_dir / "rf_cross_method_comparison.png"
-    plt.savefig(str(fig_path), dpi=200, bbox_inches="tight", facecolor="white")
-    plt.close()
-    print(f"  Comparison figure saved  : {fig_path.name}")
-
-
-# =============================================================================
-# SUPERVISED SAM CLASSIFICATION  (same training pixels as RF)
+# SUPERVISED SAM CLASSIFICATION  (image-derived endmembers)
 # =============================================================================
 
 
@@ -1418,156 +804,11 @@ def _save_sam_supervised_figure(class_map, class_names, output_dir):
     print(f"  Classification figure saved: {fig_path.name}")
 
 
-def rf_vs_sam_supervised_comparison(rf_class_map, sam_class_map,
-                                    class_names, soil_mask, output_dir):
-    """Compare the RF and supervised SAM binary AMD_FeOx classifications.
-
-    Both classifiers are trained on identical training pixels and applied to
-    the same soil domain, but use fundamentally different decision rules:
-    RF uses an ensemble of decision trees; supervised SAM uses the minimum
-    spectral angle to a class mean endmember.  Agreement between the two
-    methods is an independent consistency check: high agreement indicates
-    that the spectral separability of the training data is robust across
-    both distance-based and ensemble classification approaches.
-
-    Metrics computed
-    ----------------
-    1. Jaccard IoU — (RF_AMD ∩ SAM_AMD) / (RF_AMD ∪ SAM_AMD)
-    2. Cohen's Kappa — chance-corrected binary agreement in the soil domain
-    3. Spatial agreement map — per-pixel agreement category saved as PNG
-
-    Parameters
-    ----------
-    rf_class_map  : ndarray (rows, cols), int16  — RF output
-    sam_class_map : ndarray (rows, cols), int16  — supervised SAM output
-    class_names   : list of str
-    soil_mask     : ndarray (rows, cols), bool
-    output_dir    : Path  (RF output dir; figure saved here for cross-reference)
-    """
-    print("\n" + "=" * 70)
-    print("RF vs SUPERVISED SAM COMPARISON")
-    print("=" * 70)
-
-    amd_idx = (class_names.index("AMD_FeOx")
-               if "AMD_FeOx" in class_names else 0)
-    rf_amd  = (rf_class_map  == amd_idx)
-    sam_amd = (sam_class_map == amd_idx)
-
-    n_rf  = int(rf_amd.sum())
-    n_sam = int(sam_amd.sum())
-    n_int = int((rf_amd & sam_amd).sum())
-    n_uni = int((rf_amd | sam_amd).sum())
-    rf_only  = n_rf  - n_int
-    sam_only = n_sam - n_int
-
-    jaccard = n_int / n_uni if n_uni > 0 else 0.0
-
-    try:
-        from sklearn.metrics import cohen_kappa_score
-        soil_r, soil_c = np.where(soil_mask)
-        y_rf  = rf_amd[soil_r,  soil_c].astype(np.int32)
-        y_sam = sam_amd[soil_r, soil_c].astype(np.int32)
-        kappa = float(cohen_kappa_score(y_rf, y_sam))
-        kappa_str = f"{kappa:.4f}"
-    except Exception as exc:
-        kappa     = np.nan
-        kappa_str = f"N/A ({exc})"
-
-    print(f"\n  {'Metric':<38} {'Value':>12}")
-    print("  " + "-" * 52)
-    print(f"  {'RF AMD_FeOx pixels':<38} {n_rf:>12,}")
-    print(f"  {'Supervised SAM AMD_FeOx pixels':<38} {n_sam:>12,}")
-    print(f"  {'Both agree (intersection)':<38} {n_int:>12,}")
-    print(f"  {'Either (union)':<38} {n_uni:>12,}")
-    print(f"  {'RF only':<38} {rf_only:>12,}")
-    print(f"  {'SAM supervised only':<38} {sam_only:>12,}")
-    print(f"  {'Jaccard IoU':<38} {jaccard:>12.4f}")
-    print(f"  {'Cohen Kappa (soil domain)':<38} {kappa_str:>12}")
-
-    # ── Save CSV ──────────────────────────────────────────────────────────
-    summary_df = pd.DataFrame([
-        {"metric": "RF_AMD_pixels",       "value": n_rf},
-        {"metric": "SAM_sup_AMD_pixels",  "value": n_sam},
-        {"metric": "Intersection",        "value": n_int},
-        {"metric": "Union",               "value": n_uni},
-        {"metric": "RF_only",             "value": rf_only},
-        {"metric": "SAM_sup_only",        "value": sam_only},
-        {"metric": "Jaccard_IoU",         "value": jaccard},
-        {"metric": "Cohens_Kappa",        "value": kappa},
-    ])
-    csv_path = output_dir / "rf_vs_sam_supervised_comparison.csv"
-    summary_df.to_csv(str(csv_path), index=False)
-    print(f"\n  Comparison CSV saved: {csv_path.name}")
-
-    _save_rf_vs_sam_figure(rf_amd, sam_amd, jaccard, kappa, output_dir)
-
-    return summary_df
-
-
-def _save_rf_vs_sam_figure(rf_amd, sam_amd, jaccard, kappa, output_dir):
-    """Save a spatial agreement map for the RF vs supervised SAM comparison."""
-    from matplotlib.patches import Patch
-
-    rows, cols = rf_amd.shape
-    rf_only  = rf_amd  & ~sam_amd
-    sam_only = sam_amd & ~rf_amd
-    both     = rf_amd  & sam_amd
-
-    rgb_ov = np.ones((rows, cols, 3), dtype=np.float32) * 0.88
-    rgb_ov[rf_only]  = [0.25, 0.55, 0.85]   # blue  — RF only
-    rgb_ov[sam_only] = [0.85, 0.35, 0.20]   # red   — SAM supervised only
-    rgb_ov[both]     = [0.20, 0.72, 0.28]   # green — both agree
-
-    fig, ax = plt.subplots(figsize=(9, 12))
-    fig.suptitle(
-        "RF vs Supervised SAM — AMD_FeOx Spatial Agreement",
-        fontsize=13, fontweight="bold",
-    )
-    ax.imshow(rgb_ov, interpolation="nearest")
-    ax.axis("off")
-
-    legend_elements = [
-        Patch(fc=[0.25, 0.55, 0.85], ec="0.3", lw=0.5,
-              label=f"RF only  ({int(rf_only.sum()):,} px)"),
-        Patch(fc=[0.85, 0.35, 0.20], ec="0.3", lw=0.5,
-              label=f"SAM supervised only  ({int(sam_only.sum()):,} px)"),
-        Patch(fc=[0.20, 0.72, 0.28], ec="0.3", lw=0.5,
-              label=f"Both agree  ({int(both.sum()):,} px)"),
-        Patch(fc=[0.88, 0.88, 0.88], ec="0.4", lw=0.5,
-              label="Neither / non-soil"),
-    ]
-    ax.legend(
-        handles=legend_elements, loc="lower right", fontsize=9,
-        frameon=True, fancybox=False, edgecolor="0.4",
-    )
-
-    kappa_txt = (f"{kappa:.3f}"
-                 if not (isinstance(kappa, float) and np.isnan(kappa))
-                 else "N/A")
-    metrics_txt = (
-        f"Jaccard IoU    : {jaccard:.3f}\n"
-        f"Cohen's Kappa  : {kappa_txt}"
-    )
-    ax.text(
-        0.98, 0.04, metrics_txt,
-        transform=ax.transAxes,
-        fontsize=9, va="bottom", ha="right", family="monospace",
-        bbox=dict(boxstyle="round,pad=0.5",
-                  facecolor="lightyellow", alpha=0.88, edgecolor="0.5"),
-    )
-
-    plt.tight_layout()
-    fig_path = output_dir / "rf_vs_sam_supervised_comparison.png"
-    plt.savefig(str(fig_path), dpi=200, bbox_inches="tight", facecolor="white")
-    plt.close()
-    print(f"  Comparison figure saved: {fig_path.name}")
-
-
 def run_sam_supervised_classification(cube, soil_mask, X, y, class_names,
                                       wavelengths, output_dir):
     """Run the supervised SAM classification pipeline.
 
-    Uses the same training pixel data already loaded for the RF classifier:
+    Uses the same training pixel data already loaded for the pipeline:
     the mean spectrum per class is the SAM endmember, and nearest-endmember
     assignment is applied to all soil pixels.
 
@@ -1655,132 +896,303 @@ def run_sam_supervised_classification(cube, soil_mask, X, y, class_names,
 
 
 # =============================================================================
-# OUTPUT SAVING
+# CROSS-METHOD COMPARISON  (Supervised SAM AMD zone vs Library SAM mineral map)
 # =============================================================================
 
 
-def save_rf_outputs(class_map, prob_maps, max_prob_map,
-                    class_names, wavelengths, output_dir):
-    """Save all RF classification outputs.
+def sam_cross_method_comparison(sam_class_map, class_names, soil_mask,
+                                output_dir):
+    """Compare the supervised SAM AMD_FeOx zone against the library SAM mineral map.
 
-    Files written
-    -------------
-    rf_classification_map.tif          GeoTIFF (class codes, int16)
-    rf_classification_map.hdr/.img     ENVI classification image (int16)
-    rf_probability_maps.hdr/.img       ENVI multi-band probability image (float32)
-    rf_classification_map.png          Colour visualization with legend
-    rf_cv_scores.csv                   (written separately by the caller)
+    Both methods use the identical SAM angular similarity logic; they differ
+    only in endmember source (image-derived training means vs. USGS library
+    spectra).  Divergences therefore reflect the spectral distance between USGS
+    library references and actual Rio Tinto scene conditions — mixed pixels,
+    atmospheric residuals, and variable mineral assemblages at 30 m resolution
+    — rather than any algorithmic difference.
+
+    Metrics computed
+    ----------------
+    1. Jaccard IoU   (sup_SAM_AMD ∩ lib_SAM_union) / (sup_SAM_AMD ∪ lib_SAM_union)
+       Spatial overlap between the two binary AMD footprints.
+
+    2. Cohen's Kappa   chance-corrected binary agreement within the soil domain
+       (both maps treated as AMD-present / not-present).
+
+    3. Library SAM recall in supervised SAM zone   fraction of library SAM
+       pixels (union of all minerals) that fall inside the supervised SAM AMD
+       zone.  High recall indicates the supervised SAM zone encompasses the
+       library-detected mineral occurrences.
+
+    4. Supervised SAM efficiency   fraction of supervised SAM AMD pixels
+       confirmed by ≥ 1 library SAM mineral detection.  Lower values are
+       expected if the supervised SAM zone is broader than the library SAM
+       mineral peaks.
+
+    5. Per-mineral containment   fraction of each library SAM mineral inside
+       the supervised SAM AMD zone.
+
+    A figure is saved alongside the CSVs showing the spatial overlap map and
+    the per-mineral containment bar chart.
 
     Parameters
     ----------
-    class_map : ndarray (rows, cols), int16
-        Class codes: -1 = unclassified; 0..n-1 = class index.
-    prob_maps : ndarray (rows, cols, n_classes), float32
-    max_prob_map : ndarray (rows, cols), float32  (unused here; available for
-                  callers that want to save it separately)
-    class_names : list of str
-    wavelengths : ndarray (bands,), float  (unused; for API parity)
-    output_dir : Path
+    sam_class_map : ndarray (rows, cols), int16  — supervised SAM output
+    class_names   : list of str                  — supervised SAM class names
+    soil_mask     : ndarray (rows, cols), bool
+    output_dir    : Path
+
+    Returns
+    -------
+    summary_df : pd.DataFrame or None
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    rows, cols = class_map.shape
+    lib_sam_hdr = Path(SAM_CLASS_MAP_FILE)
+    if not lib_sam_hdr.exists():
+        print(
+            f"\n  [sam-cross-method] Library SAM classification map not found at:\n"
+            f"    {lib_sam_hdr}\n"
+            "  Skipping cross-method comparison.  Run multi_mineral_sam_fixed.py "
+            "first."
+        )
+        return None
 
-    # ── GeoTIFF ──────────────────────────────────────────────────────────
-    _save_geotiff(class_map, output_dir / "rf_classification_map.tif")
+    print("\n" + "=" * 70)
+    print("CROSS-METHOD COMPARISON  "
+          "(Supervised SAM AMD Zone vs Library SAM Mineral Map)")
+    print("=" * 70)
 
-    # ── ENVI classification map ───────────────────────────────────────────
-    # Class 0 = Unclassified (stored as 0 in uint16; -1 maps to 0)
-    display_map = (class_map + 1).astype(np.uint16)   # -1→0, 0→1, ...
-    envi_meta = {
-        "lines":       rows,
-        "samples":     cols,
-        "bands":       1,
-        "data type":   12,     # uint16
-        "interleave":  "bsq",
-        "byte order":  0,
-        "class names": ["Unclassified"] + class_names,
-        "classes":     len(class_names) + 1,
-        "description": "Random Forest classification map",
-    }
-    envi_hdr = output_dir / "rf_classification_map.hdr"
-    sp.envi.save_image(str(envi_hdr), display_map, metadata=envi_meta, force=True)
-    print(f"  ENVI classification map saved: rf_classification_map.hdr/.img")
+    lib_img = sp.open_image(str(lib_sam_hdr))
+    lib_map = np.squeeze(lib_img.load()[:, :, 0]).astype(np.int32)
 
-    # ── ENVI probability maps (n_classes bands) ──────────────────────────
-    prob_meta = {
-        "lines":       rows,
-        "samples":     cols,
-        "bands":       len(class_names),
-        "data type":   4,      # float32
-        "interleave":  "bip",
-        "byte order":  0,
-        "band names":  class_names,
-        "description": "Random Forest per-class posterior probabilities",
-    }
-    prob_hdr = output_dir / "rf_probability_maps.hdr"
-    sp.envi.save_image(str(prob_hdr), prob_maps, metadata=prob_meta, force=True)
-    print(f"  ENVI probability maps saved: rf_probability_maps.hdr/.img")
+    lib_class_meta = lib_img.metadata.get("class names", [])
+    lib_mineral_names = list(lib_class_meta[1:]) if len(lib_class_meta) > 1 else []
+    print(f"\n  Library SAM mineral classes ({len(lib_mineral_names)}): "
+          f"{lib_mineral_names}")
 
-    # ── Colour visualisation ─────────────────────────────────────────────
-    _save_classification_figure(class_map, class_names, output_dir)
+    # ── Supervised SAM AMD_FeOx binary mask ───────────────────────────────
+    if "AMD_FeOx" in class_names:
+        amd_idx = class_names.index("AMD_FeOx")
+    else:
+        amd_idx = next(
+            (i for i, n in enumerate(class_names) if n.lower() != "background"),
+            0,
+        )
+        print(f"  WARNING: 'AMD_FeOx' not found in class_names — using "
+              f"class index {amd_idx} ({class_names[amd_idx]}) as AMD mask.")
+
+    sup_amd = (sam_class_map == amd_idx)
+    lib_any = (lib_map > 0)   # union of all library SAM mineral detections
+
+    n_sup          = int(sup_amd.sum())
+    n_lib          = int(lib_any.sum())
+    n_intersection = int((sup_amd & lib_any).sum())
+    n_union        = int((sup_amd | lib_any).sum())
+
+    jaccard        = n_intersection / n_union if n_union > 0 else 0.0
+    lib_recall     = n_intersection / n_lib   if n_lib   > 0 else 0.0
+    sup_efficiency = n_intersection / n_sup   if n_sup   > 0 else 0.0
+
+    # ── Cohen's Kappa (soil domain only) ──────────────────────────────────
+    try:
+        from sklearn.metrics import cohen_kappa_score
+        soil_r, soil_c = np.where(soil_mask)
+        y_sup = sup_amd[soil_r, soil_c].astype(np.int32)
+        y_lib = lib_any[soil_r, soil_c].astype(np.int32)
+        kappa = float(cohen_kappa_score(y_lib, y_sup))
+        kappa_str = f"{kappa:.4f}"
+    except ImportError:
+        kappa     = np.nan
+        kappa_str = "N/A (sklearn missing)"
+    except Exception as exc:
+        kappa     = np.nan
+        kappa_str = f"N/A ({exc})"
+
+    # ── Print global summary ──────────────────────────────────────────────
+    print(f"\n  {'Metric':<45} {'Value':>12}")
+    print("  " + "-" * 59)
+    print(f"  {'Supervised SAM AMD_FeOx pixels':<45} {n_sup:>12,}")
+    print(f"  {'Library SAM pixels (all minerals, union)':<45} {n_lib:>12,}")
+    print(f"  {'Intersection':<45} {n_intersection:>12,}")
+    print(f"  {'Union':<45} {n_union:>12,}")
+    print(f"  {'Jaccard IoU':<45} {jaccard:>12.4f}")
+    lbl_kappa = "Cohen's Kappa (soil domain)"
+    print(f"  {lbl_kappa:<45} {kappa_str:>12}")
+    print(f"  {'Library SAM recall in sup SAM zone (%)':<45} "
+          f"{lib_recall * 100:>11.1f}%")
+    print(f"  {'Supervised SAM efficiency / lib-confirmed (%)':<45} "
+          f"{sup_efficiency * 100:>11.1f}%")
+
+    # ── Per-mineral containment ───────────────────────────────────────────
+    per_mineral = []
+    print(f"\n  Per-library-SAM-mineral containment within supervised SAM AMD zone:")
+    print(f"  {'SAM Mineral':<28} {'n_lib':>8} {'n_in_sup':>10} {'% in sup':>9}")
+    print("  " + "-" * 58)
+    for i, mineral in enumerate(lib_mineral_names, start=1):
+        mineral_mask = (lib_map == i)
+        n_mineral    = int(mineral_mask.sum())
+        n_in_sup     = int((mineral_mask & sup_amd).sum())
+        pct          = n_in_sup / n_mineral * 100 if n_mineral > 0 else 0.0
+        print(f"  {mineral:<28} {n_mineral:>8,} {n_in_sup:>10,} {pct:>8.1f}%")
+        per_mineral.append({
+            "SAM_mineral":    mineral,
+            "n_lib_SAM":      n_mineral,
+            "n_in_sup_SAM":   n_in_sup,
+            "pct_in_sup_SAM": pct,
+        })
+
+    # ── Save CSVs ─────────────────────────────────────────────────────────
+    summary_records = [
+        {"metric": "SupSAM_AMD_pixels",        "value": n_sup},
+        {"metric": "LibSAM_union_pixels",       "value": n_lib},
+        {"metric": "Intersection",              "value": n_intersection},
+        {"metric": "Union",                     "value": n_union},
+        {"metric": "Jaccard_IoU",               "value": jaccard},
+        {"metric": "Cohens_Kappa",              "value": kappa},
+        {"metric": "LibSAM_recall_in_supSAM",   "value": lib_recall},
+        {"metric": "SupSAM_efficiency",         "value": sup_efficiency},
+    ]
+    summary_df  = pd.DataFrame(summary_records)
+    summary_csv = output_dir / "sam_cross_method_comparison.csv"
+    summary_df.to_csv(str(summary_csv), index=False)
+
+    per_min_df  = pd.DataFrame(per_mineral)
+    per_min_csv = output_dir / "sam_per_mineral_containment.csv"
+    per_min_df.to_csv(str(per_min_csv), index=False)
+
+    print(f"\n  Summary metrics saved : {summary_csv.name}")
+    print(f"  Per-mineral CSV saved : {per_min_csv.name}")
+
+    # ── Comparison figure ─────────────────────────────────────────────────
+    _save_sam_cross_method_figure(
+        sup_amd, lib_any, per_mineral,
+        jaccard, kappa, lib_recall, sup_efficiency,
+        output_dir,
+    )
+
+    return summary_df
 
 
-def _save_classification_figure(class_map, class_names, output_dir):
-    """Save a publication-quality visualisation of the RF classification map.
+def _save_sam_cross_method_figure(sup_amd, lib_any, per_mineral,
+                                   jaccard, kappa, lib_recall, sup_efficiency,
+                                   output_dir):
+    """Save a two-panel spatial agreement figure for the supervised vs library SAM.
 
-    Mirrors the style of create_composite_map() in multi_mineral_sam_fixed.py:
-    white background, light-grey non-soil domain, medium-grey unclassified
-    soil pixels, and class-specific colours for mineral detections.
+    Left panel  — spatial overlap map coded by agreement category.
+    Right panel — per-library-SAM-mineral containment bar chart + metrics box.
+
+    Colour scheme
+    -------------
+    Blue   — supervised SAM AMD zone only
+    Orange — library SAM minerals only
+    Green  — both agree
+    Grey   — neither / non-soil
     """
     from matplotlib.patches import Patch
 
-    rows, cols = class_map.shape
-    rgba = np.ones((rows, cols, 4), dtype=np.float32)  # white background
+    rows, cols = sup_amd.shape
 
-    # Light grey for unclassified soil (-1 code mapped to white/grey)
-    # Medium grey: unclassified = -1
-    rgba[class_map == -1] = [0.78, 0.78, 0.78, 1.0]
+    # ── Spatial overlap categories ────────────────────────────────────────
+    sup_only = sup_amd & ~lib_any
+    lib_only = lib_any & ~sup_amd
+    both     = sup_amd & lib_any
 
-    # Class colours
-    for cls_idx, cls_name in enumerate(class_names):
-        if EXCLUDE_BACKGROUND and cls_name == "Background":
-            continue
-        c = CLASS_COLORS.get(cls_name, "#888888")
-        rgba[class_map == cls_idx] = _hex_to_rgba(c, alpha=1.0)
+    # Build RGB image
+    rgb_ov = np.ones((rows, cols, 3), dtype=np.float32) * 0.88  # neutral grey
+    rgb_ov[sup_only] = [0.25, 0.55, 0.85]   # blue   — supervised SAM only
+    rgb_ov[lib_only] = [0.90, 0.55, 0.10]   # orange — library SAM only
+    rgb_ov[both]     = [0.20, 0.72, 0.28]   # green  — agreement
 
-    fig, ax = plt.subplots(figsize=(8, 12))
-    ax.imshow(rgba, interpolation="nearest")
-    ax.set_title(
-        "Random Forest — AMD Ferro-oxide Lithology\n"
-        f"(prob threshold = {PROB_THRESHOLD}, "
-        f"min component = {MIN_COMPONENT_SIZE} px)",
-        fontsize=11, fontweight="bold"
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    fig.suptitle(
+        "Supervised SAM AMD Zone vs. Library SAM Mineral Map — Spatial Agreement\n"
+        "(divergences reflect USGS library–scene spectral distance, "
+        "not algorithmic differences)",
+        fontsize=12, fontweight="bold",
     )
-    ax.axis("off")
 
-    # Legend
+    # ── Left: overlap map ─────────────────────────────────────────────────
+    ax_map = axes[0]
+    ax_map.imshow(rgb_ov, interpolation="nearest")
+    ax_map.set_title("Spatial Overlap Map", fontsize=11, fontweight="bold")
+    ax_map.axis("off")
     legend_elements = [
-        Patch(fc=(0.78, 0.78, 0.78), ec="0.5", lw=0.4, label="Unclassified / non-soil"),
+        Patch(fc=[0.25, 0.55, 0.85], ec="0.3", lw=0.5,
+              label=f"Supervised SAM only  ({int(sup_only.sum()):,} px)"),
+        Patch(fc=[0.90, 0.55, 0.10], ec="0.3", lw=0.5,
+              label=f"Library SAM only  ({int(lib_only.sum()):,} px)"),
+        Patch(fc=[0.20, 0.72, 0.28], ec="0.3", lw=0.5,
+              label=f"Both agree  ({int(both.sum()):,} px)"),
+        Patch(fc=[0.88, 0.88, 0.88], ec="0.4", lw=0.5,
+              label="Neither / non-soil"),
     ]
-    for cls_name in class_names:
-        if EXCLUDE_BACKGROUND and cls_name == "Background":
-            continue
-        c = CLASS_COLORS.get(cls_name, "#888888")
-        legend_elements.append(
-            Patch(fc=c, ec="0.3", lw=0.4, label=cls_name.replace("_", " "))
-        )
-    ax.legend(
-        handles=legend_elements,
-        loc="lower right", fontsize=8,
+    ax_map.legend(
+        handles=legend_elements, loc="lower right", fontsize=8.5,
         frameon=True, fancybox=False, edgecolor="0.4",
-        handlelength=1.2, handleheight=0.9,
+    )
+
+    # ── Right: per-mineral containment bar chart ──────────────────────────
+    ax_bar = axes[1]
+    minerals = [d["SAM_mineral"] for d in per_mineral]
+    pcts     = [d["pct_in_sup_SAM"] for d in per_mineral]
+
+    if pcts:
+        bar_colors = plt.cm.RdYlGn(np.array(pcts) / 100.0)
+        bars = ax_bar.barh(
+            minerals, pcts,
+            color=bar_colors, edgecolor="0.4", linewidth=0.6,
+        )
+        ax_bar.axvline(
+            100, color="0.4", linestyle="--", linewidth=0.9, alpha=0.7,
+            label="100 % containment",
+        )
+        ax_bar.set_xlim(0, 118)
+        for bar, pct in zip(bars, pcts):
+            ax_bar.text(
+                min(pct + 1.2, 114),
+                bar.get_y() + bar.get_height() / 2,
+                f"{pct:.1f}%",
+                va="center", fontsize=8.5,
+            )
+    else:
+        ax_bar.text(0.5, 0.5, "No library SAM minerals found",
+                    ha="center", va="center", transform=ax_bar.transAxes)
+
+    ax_bar.set_xlabel(
+        "% of library SAM mineral pixels inside supervised SAM AMD zone",
+        fontsize=9,
+    )
+    ax_bar.set_title(
+        "Per-mineral library SAM containment in supervised SAM AMD zone\n"
+        "(high % = supervised SAM zone encloses the library SAM detections)",
+        fontsize=10, fontweight="bold",
+    )
+    ax_bar.grid(True, axis="x", alpha=0.3)
+
+    # Global metrics text box
+    kappa_txt = (f"{kappa:.3f}"
+                 if not (isinstance(kappa, float) and np.isnan(kappa))
+                 else "N/A")
+    metrics_txt = (
+        f"Jaccard IoU              : {jaccard:.3f}\n"
+        f"Cohen's Kappa            : {kappa_txt}\n"
+        f"Lib SAM recall in sup SAM: {lib_recall * 100:.1f}%\n"
+        f"Sup SAM efficiency       : {sup_efficiency * 100:.1f}%"
+    )
+    ax_bar.text(
+        0.98, 0.04, metrics_txt,
+        transform=ax_bar.transAxes,
+        fontsize=8.5, va="bottom", ha="right", family="monospace",
+        bbox=dict(
+            boxstyle="round,pad=0.5",
+            facecolor="lightyellow", alpha=0.88, edgecolor="0.5",
+        ),
     )
 
     plt.tight_layout()
-    fig_path = output_dir / "rf_classification_map.png"
+    fig_path = output_dir / "sam_cross_method_comparison.png"
     plt.savefig(str(fig_path), dpi=200, bbox_inches="tight", facecolor="white")
     plt.close()
-    print(f"  Classification figure saved: {fig_path.name}")
+    print(f"  Comparison figure saved  : {fig_path.name}")
 
 
 # =============================================================================
@@ -1788,8 +1200,13 @@ def _save_classification_figure(class_map, class_names, output_dir):
 # =============================================================================
 
 
-def run_rf_classification(training_npz=None, hdr_file=None, output_dir=None):
-    """Run the full supervised RF classification pipeline.
+def run_supervised_classification(training_npz=None, hdr_file=None,
+                                   output_dir=None):
+    """Run the full supervised SAM classification pipeline.
+
+    Loads training pixels, computes image-derived SAM endmembers, classifies
+    all soil pixels, validates the result, and runs the cross-method comparison
+    against the library SAM mineral map.
 
     Parameters
     ----------
@@ -1810,7 +1227,7 @@ def run_rf_classification(training_npz=None, hdr_file=None, output_dir=None):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("SUPERVISED CLASSIFICATION — RANDOM FOREST")
+    print("SUPERVISED CLASSIFICATION — SAM (image-derived endmembers)")
     print("=" * 70)
 
     # ── 1. Load image ─────────────────────────────────────────────────────
@@ -1833,7 +1250,6 @@ def run_rf_classification(training_npz=None, hdr_file=None, output_dir=None):
         soil_mask = np.load(str(mask_path)).astype(bool)
         print(f"   Loaded soil_mask.npy ({soil_mask.sum():,} soil pixels)")
     else:
-        # Fallback: valid-data mask (non-zero spectral norm)
         norms = np.linalg.norm(cube.reshape(-1, bands), axis=1)
         soil_mask = (norms > 0).reshape(rows, cols)
         print("   WARNING: soil_mask.npy not found — using valid-data mask.")
@@ -1849,71 +1265,17 @@ def run_rf_classification(training_npz=None, hdr_file=None, output_dir=None):
         training_npz, cube, soil_mask, wavelengths
     )
 
-    # ── 4. Cross-validation and training ──────────────────────────────────
-    print(f"\n4. Training Random Forest ({CV_FOLDS}-fold stratified CV)...")
-    rf, cv_scores = train_with_cross_validation(X, y, class_names)
-
-    # Save CV scores
-    cv_df = pd.DataFrame({
-        "fold": np.arange(1, CV_FOLDS + 1),
-        "balanced_accuracy": cv_scores,
-    })
-    cv_df.to_csv(output_dir / "rf_cv_scores.csv", index=False)
-    print(f"\n   CV scores saved: rf_cv_scores.csv")
-
-    # ── 5. Apply classifier ───────────────────────────────────────────────
-    print(f"\n5. Applying classifier to all soil pixels "
-          f"(prob threshold = {PROB_THRESHOLD})...")
-    class_map, prob_maps, max_prob_map = apply_classifier(
-        rf, cube, soil_mask, class_names
-    )
-
-    # ── 6. Connected-component noise filter ───────────────────────────────
-    print(f"\n6. Applying connected-component noise filter "
-          f"(< {MIN_COMPONENT_SIZE} px)...")
-    noise_fracs, pre_counts, post_counts = apply_noise_filter(
-        class_map, class_names
-    )
-
-    # Print post-filter pixel counts
-    print(f"\n   Post-filter class pixel counts:")
-    for cls_name in class_names:
-        if EXCLUDE_BACKGROUND and cls_name == "Background":
-            continue
-        pre  = pre_counts.get(cls_name, 0)
-        post = post_counts.get(cls_name, 0)
-        print(f"   {cls_name:<22} {post:>10,}  (was {pre:,})")
-
-    # ── 7. Validation ─────────────────────────────────────────────────────
-    print(f"\n7. Running validation metrics...")
-    val_df = validate_rf_results(
-        class_map, prob_maps, max_prob_map,
-        soil_mask, cube, wavelengths, class_names,
-        rf, noise_fracs, output_dir
-    )
-
-    # ── 8. Cross-method comparison ────────────────────────────────────────
-    print(f"\n8. Cross-method comparison (RF AMD lithology vs SAM mineral map)...")
-    iou_df = cross_method_comparison(class_map, class_names, soil_mask, output_dir)
-
-    # ── 9. Save outputs ───────────────────────────────────────────────────
-    print(f"\n9. Saving classification outputs to:\n   {output_dir}")
-    save_rf_outputs(
-        class_map, prob_maps, max_prob_map,
-        class_names, wavelengths, output_dir
-    )
-
-    # ── 10. Supervised SAM classification (same training pixels) ──────────
-    print(f"\n10. Supervised SAM classification (same training pixels as RF)...")
-    sam_output_dir = Path(SAM_SUPERVISED_OUTPUT_FOLDER)
+    # ── 4. Supervised SAM classification ──────────────────────────────────
+    print(f"\n4. Running supervised SAM classification...")
     sam_class_map = run_sam_supervised_classification(
-        cube, soil_mask, X, y, class_names, wavelengths, sam_output_dir
+        cube, soil_mask, X, y, class_names, wavelengths, output_dir
     )
 
-    # ── 11. RF vs supervised SAM comparison ───────────────────────────────
-    print(f"\n11. RF vs supervised SAM agreement comparison...")
-    rf_vs_sam_supervised_comparison(
-        class_map, sam_class_map, class_names, soil_mask, output_dir
+    # ── 5. Cross-method comparison (supervised SAM vs library SAM) ─────────
+    print(f"\n5. Cross-method comparison "
+          f"(supervised SAM AMD zone vs library SAM mineral map)...")
+    sam_cross_method_comparison(
+        sam_class_map, class_names, soil_mask, output_dir
     )
 
     print("\n" + "=" * 70)
@@ -1921,7 +1283,6 @@ def run_rf_classification(training_npz=None, hdr_file=None, output_dir=None):
     print("=" * 70)
     print(f"\nOutput directory: {output_dir.resolve()}")
 
-    # Final summary
     print("\nClass pixel counts (after noise filter):")
     print(f"  {'Class':<22} {'Pixels':>10} {'% of soil':>12}")
     print("  " + "-" * 48)
@@ -1929,15 +1290,14 @@ def run_rf_classification(training_npz=None, hdr_file=None, output_dir=None):
     for cls_idx, cls_name in enumerate(class_names):
         if EXCLUDE_BACKGROUND and cls_name == "Background":
             continue
-        n = int((class_map == cls_idx).sum())
+        n = int((sam_class_map == cls_idx).sum())
         pct = n / n_soil_total * 100 if n_soil_total > 0 else 0.0
         print(f"  {cls_name:<22} {n:>10,} {pct:>11.2f}%")
-    n_unclass = int((class_map == -1).sum() - (~soil_mask).sum())
-    n_unclass = max(n_unclass, 0)
+    n_unclass = max(int((sam_class_map == -1).sum() - (~soil_mask).sum()), 0)
     print(f"  {'Unclassified (soil)':<22} {n_unclass:>10,}")
     print(f"  {'Total soil pixels':<22} {n_soil_total:>10,}")
 
-    return class_map
+    return sam_class_map
 
 
 # =============================================================================
@@ -1946,11 +1306,16 @@ def run_rf_classification(training_npz=None, hdr_file=None, output_dir=None):
 
 
 def main():
-    """Command-line entry point for the supervised classification pipeline."""
+    """Command-line entry point for the supervised SAM classification pipeline."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Random Forest supervised classification for EO-1 Hyperion AMD mapping."
+        description=(
+            "Supervised SAM classification for EO-1 Hyperion AMD mapping.\n"
+            "Computes image-derived endmembers from training pixels and runs\n"
+            "SAM nearest-endmember classification, then compares the result\n"
+            "against the library SAM mineral map."
+        )
     )
     parser.add_argument(
         "--training",
@@ -1969,7 +1334,7 @@ def main():
     )
     args = parser.parse_args()
 
-    run_rf_classification(
+    run_supervised_classification(
         training_npz=args.training,
         hdr_file=args.hdr,
         output_dir=args.output,

@@ -20,26 +20,22 @@ Each stage builds on the previous one:
   training pixels for the binary AMD_FeOx / Background classification.
   Saves training_pixels.npz.  This stage is INTERACTIVE and requires a display.
 
-  Stage 3 — Supervised RF + SAM Classification (supervised_classification.py)
-  ---------------------------------------------------------------------------
-  Loads training_pixels.npz and runs two parallel supervised classifiers on
-  the same training data:
+  Stage 3 — Supervised SAM Classification (supervised_classification.py)
+  -----------------------------------------------------------------------
+  Loads training_pixels.npz and runs a supervised Spectral Angle Mapper
+  using image-derived endmembers (mean spectrum per training class, L2-
+  normalised).  This serves as the internal cross-validation of the primary
+  library-driven SAM workflow — both methods use the identical SAM angular
+  similarity logic, differing only in endmember source.
 
-  3a. Random Forest: trains a binary RandomForestClassifier (AMD_FeOx vs
-      Background) with 5-fold stratified cross-validation, applies it to all
-      soil-masked pixels with a 0.60 probability threshold, filters noise
-      components, and validates with Moran's I / feature importances.
-      Cross-method comparison with the SAM mineral-specific results is also
-      computed (Jaccard, Kappa, per-mineral containment).
+  A cross-method comparison between the supervised SAM AMD zone and the
+  library SAM mineral map is computed automatically (Jaccard IoU, Cohen's
+  Kappa, per-mineral containment), and divergences are interpreted as
+  reflecting the spectral distance between USGS library references and
+  actual Rio Tinto scene conditions.
 
-  3b. Supervised SAM: computes the mean L2-normalised spectrum per training
-      class as the SAM endmember, applies nearest-endmember assignment to all
-      soil pixels, filters noise components, and validates with the same
-      metrics as the RF (Moran's I, noise fraction, min-angle statistics).
-
-  A direct RF vs supervised SAM agreement comparison (Jaccard IoU, Cohen's
-  Kappa, spatial disagreement map) closes the stage.
-  Result: broad AMD ferro-oxide lithology footprint from two classifiers
+  Result: broad AMD ferro-oxide lithology footprint (supervised SAM) with
+  spatial agreement statistics against the primary library SAM output.
 
 Usage
 -----
@@ -49,12 +45,12 @@ Usage
     # Run individual stages
     python run_pipeline.py --stage sam
     python run_pipeline.py --stage select
-    python run_pipeline.py --stage rf
+    python run_pipeline.py --stage supervised
 
     # Skip the SAM stage if already computed (soil_mask.npy must exist)
     python run_pipeline.py --skip-sam
 
-    # Run SAM + RF only (skip interactive selection, use existing training pixels)
+    # Run SAM + supervised classification only (skip interactive selection)
     python run_pipeline.py --skip-select
 
 Dependencies
@@ -66,7 +62,7 @@ Stage 1 (SAM):
 Stage 2 (Training GUI):
     numpy, spectral, matplotlib, scipy
 
-Stage 3 (RF):
+Stage 3 (Supervised SAM):
     numpy, spectral, scikit-learn, pandas, matplotlib
     esda, libpysal (for Moran's I)
     rasterio (optional, for GeoTIFF export)
@@ -77,8 +73,8 @@ Notes
   --skip-select and ensure training_pixels.npz already exists.
 * Paths are inherited from the constants in each module.  Edit the HDR_FILE,
   OUTPUT_FOLDER, TRAINING_PIXELS_FILE, etc. in each module for custom paths.
-* All outputs are written to amd_mapping/outputs/classifications/ (SAM) and
-  amd_mapping/outputs/supervised_classification/ (RF).
+* All outputs are written to amd_mapping/outputs/classifications/ (library SAM)
+  and amd_mapping/outputs/supervised_sam/ (supervised SAM).
 """
 
 import sys
@@ -198,9 +194,11 @@ def run_selection_stage():
         print(f"\n  training_pixels.npz saved at: {npz_path}")
 
 
-def run_rf_stage():
-    """Run Stage 3: Supervised Random Forest classification."""
-    _section("STAGE 3 — RF CLASSIFICATION  (supervised_classification.py)")
+def run_supervised_stage():
+    """Run Stage 3: Supervised SAM classification and cross-method comparison."""
+    _section(
+        "STAGE 3 — SUPERVISED SAM CLASSIFICATION  (supervised_classification.py)"
+    )
 
     t0 = time.time()
 
@@ -216,7 +214,7 @@ def run_rf_stage():
     _check_file(sc.HDR_FILE,             "Reflectance cube (.hdr)")
     _check_file(sc.TRAINING_PIXELS_FILE, "Training pixel dictionary (.npz)")
 
-    sc.run_rf_classification()
+    sc.run_supervised_classification()
 
     elapsed = time.time() - t0
     print(f"\n  Stage 3 completed in {elapsed / 60:.1f} min.")
@@ -229,24 +227,24 @@ def run_rf_stage():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AMD Mineral Mapping Pipeline — orchestrates SAM + training "
-                    "selection + Random Forest classification.",
+        description="AMD Mineral Mapping Pipeline — orchestrates library SAM + "
+                    "training pixel selection + supervised SAM classification.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python run_pipeline.py                    # full pipeline (all 3 stages)
-  python run_pipeline.py --stage sam        # Stage 1 only
-  python run_pipeline.py --stage select     # Stage 2 only (interactive)
-  python run_pipeline.py --stage rf         # Stage 3 only
-  python run_pipeline.py --skip-sam         # skip Stage 1 (soil mask must exist)
-  python run_pipeline.py --skip-select      # skip Stage 2 (training_pixels.npz must exist)
+  python run_pipeline.py                         # full pipeline (all 3 stages)
+  python run_pipeline.py --stage sam             # Stage 1 only
+  python run_pipeline.py --stage select          # Stage 2 only (interactive)
+  python run_pipeline.py --stage supervised      # Stage 3 only
+  python run_pipeline.py --skip-sam              # skip Stage 1 (soil mask must exist)
+  python run_pipeline.py --skip-select           # skip Stage 2 (training_pixels.npz must exist)
         """,
     )
 
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--stage",
-        choices=["sam", "select", "rf"],
+        choices=["sam", "select", "supervised"],
         help="Run only a single stage.",
     )
     mode_group.add_argument(
@@ -265,7 +263,7 @@ examples:
 
     print("=" * 70)
     print("  AMD MINERAL MAPPING PIPELINE")
-    print("  EO-1 Hyperion Hyperspectral — SAM + Random Forest Workflow")
+    print("  EO-1 Hyperion Hyperspectral — Library SAM + Supervised SAM Workflow")
     print("=" * 70)
     print(f"  Working directory: {BASE_DIR}")
 
@@ -273,15 +271,15 @@ examples:
     errors = []
 
     # Determine which stages to run
-    run_sam    = True
-    run_select = True
-    run_rf     = True
+    run_sam        = True
+    run_select     = True
+    run_supervised = True
 
     if args.stage == "sam":
-        run_select = run_rf = False
+        run_select = run_supervised = False
     elif args.stage == "select":
-        run_sam = run_rf = False
-    elif args.stage == "rf":
+        run_sam = run_supervised = False
+    elif args.stage == "supervised":
         run_sam = run_select = False
     elif args.skip_sam:
         run_sam = False
@@ -290,9 +288,12 @@ examples:
 
     print(
         f"\n  Stages to run:"
-        f"\n    Stage 1 — SAM classification :    {'YES' if run_sam    else 'SKIPPED'}"
-        f"\n    Stage 2 — Pixel selection    :    {'YES' if run_select else 'SKIPPED'}"
-        f"\n    Stage 3 — RF classification  :    {'YES' if run_rf     else 'SKIPPED'}"
+        f"\n    Stage 1 — Library SAM classification :    "
+        f"{'YES' if run_sam        else 'SKIPPED'}"
+        f"\n    Stage 2 — Pixel selection            :    "
+        f"{'YES' if run_select     else 'SKIPPED'}"
+        f"\n    Stage 3 — Supervised SAM             :    "
+        f"{'YES' if run_supervised else 'SKIPPED'}"
     )
 
     # ── Stage 1 ────────────────────────────────────────────────────────
@@ -301,7 +302,7 @@ examples:
             run_sam_stage()
         except Exception as exc:
             print(f"\n  [ERROR] Stage 1 failed: {exc}")
-            errors.append(("Stage 1 (SAM)", exc))
+            errors.append(("Stage 1 (Library SAM)", exc))
             print("  Attempting to continue with remaining stages...")
 
     # ── Stage 2 ────────────────────────────────────────────────────────
@@ -314,12 +315,12 @@ examples:
             print("  Attempting to continue with Stage 3...")
 
     # ── Stage 3 ────────────────────────────────────────────────────────
-    if run_rf:
+    if run_supervised:
         try:
-            run_rf_stage()
+            run_supervised_stage()
         except Exception as exc:
             print(f"\n  [ERROR] Stage 3 failed: {exc}")
-            errors.append(("Stage 3 (RF)", exc))
+            errors.append(("Stage 3 (Supervised SAM)", exc))
 
     # ── Summary ────────────────────────────────────────────────────────
     total_elapsed = time.time() - pipeline_start
@@ -334,21 +335,18 @@ examples:
             print(f"    ✗  {stage_name}: {type(exc).__name__}: {exc}")
         sys.exit(1)
     else:
-        completed = sum([run_sam, run_select, run_rf])
+        completed = sum([run_sam, run_select, run_supervised])
         print(f"\n  All {completed} requested stage(s) completed successfully.")
         print(
             "\n  Output locations:"
-            "\n    SAM (multi-mineral) →  amd_mapping/outputs/classifications/"
-            "\n    RF supervised       →  amd_mapping/outputs/supervised_classification/"
-            "\n    SAM supervised      →  amd_mapping/outputs/supervised_sam/"
-            "\n    Training px         →  amd_mapping/outputs/training_pixels.npz"
+            "\n    Library SAM (multi-mineral) →  amd_mapping/outputs/classifications/"
+            "\n    Supervised SAM              →  amd_mapping/outputs/supervised_sam/"
+            "\n    Training pixels             →  amd_mapping/outputs/training_pixels.npz"
             "\n\n  Key outputs:"
-            "\n    SAM (multi-min) : mineral-specific map    classification_map.hdr"
-            "\n    RF              : AMD_FeOx map            rf_classification_map.hdr"
-            "\n    SAM supervised  : AMD_FeOx map            sam_classification_map.hdr"
-            "\n    RF vs SAM-lib   : rf_cross_method_comparison.{csv,png}"
-            "\n                      rf_per_mineral_containment.csv"
-            "\n    RF vs SAM-sup   : rf_vs_sam_supervised_comparison.{csv,png}"
+            "\n    Library SAM  : mineral-specific map    classification_map.hdr"
+            "\n    Supervised SAM: AMD_FeOx map           sam_classification_map.hdr"
+            "\n    SAM cross-method: sam_cross_method_comparison.{csv,png}"
+            "\n                      sam_per_mineral_containment.csv"
         )
 
 
