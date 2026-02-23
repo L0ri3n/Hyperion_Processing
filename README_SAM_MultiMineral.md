@@ -418,14 +418,19 @@ If you encounter problems:
 ## Supervised Classification Extension (February 2026)
 
 Two additional modules extend the workflow with a scene-specific supervised
-classification that runs after the SAM stage and compares results against it.
+SAM classification that runs after the library SAM stage and compares results
+against it.  Both methods use the identical SAM angular similarity logic;
+they differ only in endmember source (image-derived training means vs. USGS
+library spectra).  Divergences therefore reflect the spectral distance between
+USGS library references and actual scene conditions rather than any
+algorithmic difference.
 
 ### Overview
 
 ```
 Stage 1  multi_mineral_sam_fixed.py   → SAM classification + soil_mask.npy
 Stage 2  training_pixel_selector.py   → Interactive training pixel labelling
-Stage 3  supervised_classification.py → Random Forest classification + validation
+Stage 3  supervised_classification.py → Supervised SAM classification + validation
 ```
 
 Run all three stages with:
@@ -437,10 +442,10 @@ python run_pipeline.py
 Or run individual stages:
 
 ```bash
-python run_pipeline.py --stage sam      # Stage 1 only
-python run_pipeline.py --stage select   # Stage 2 only (interactive)
-python run_pipeline.py --stage rf       # Stage 3 only
-python run_pipeline.py --skip-sam       # Stages 2+3 (soil_mask.npy must exist)
+python run_pipeline.py --stage sam          # Stage 1 only
+python run_pipeline.py --stage select       # Stage 2 only (interactive)
+python run_pipeline.py --stage supervised   # Stage 3 only
+python run_pipeline.py --skip-sam           # Stages 2+3 (soil_mask.npy must exist)
 ```
 
 ---
@@ -457,15 +462,17 @@ Opens a full-screen dark-themed matplotlib window.
 | NIR False Colour | 850 / 660 / 550 nm | Vegetation vs bare soil |
 | Fe³⁺ Oxide Ratio | 900 / 660 nm (ratio) | Iron oxide intensity |
 
-**AMD target classes:** Goethite, Hematite, Jarosite\_Na, Jarosite\_K,
-Schwertmannite, Pyrite, Background.
+**Training classes:** `AMD_FeOx` (iron-oxide bearing pixels) and `Background`
+(unaltered soil).  Binary classification is intentional: the supervised SAM
+produces a broad ferro-oxide lithology footprint, which is then compared against
+the per-mineral library SAM detections.
 
 **How to use:**
 1. Select a View and a Class using the radio buttons.
 2. Left-click + drag to draw a rectangular ROI on the image.
 3. The spectral profile panel (right) shows the mean ± 1σ spectrum of
    the selected soil pixels and reference lines at 430, 660, 875 nm.
-4. Repeat for all classes.
+4. Repeat for both classes.
 5. Click **Save & Continue** to write `training_pixels.npz` and close.
 
 **Soil mask overlay** (yellow semi-transparent fill, toggleable) shows
@@ -475,54 +482,61 @@ which pixels are eligible for inclusion in the training set.
 
 ---
 
-### 5. `supervised_classification.py` — Random Forest Classification
+### 5. `supervised_classification.py` — Supervised SAM Classification
 
-**Classifier:**
-```python
-RandomForestClassifier(n_estimators=200, class_weight='balanced', random_state=42)
-```
+**Approach:** nearest-endmember Spectral Angle Mapper using image-derived
+endmembers (mean L2-normalised training spectrum per class).
 
 **Pipeline:**
 1. Load training pixels from `.npz`; extract spectral feature vectors (all bands).
-2. 5-fold stratified cross-validation — reports balanced accuracy per fold and mean ± std.
-3. Apply classifier to all soil-masked pixels; reject predictions with max class
-   probability < 0.60.
-4. Connected-component noise filter (< 4 px), matching the SAM post-processing.
+   NaN bands (water-vapour / detector-gap channels) are imputed with the
+   per-band column mean.
+2. Compute the mean L2-normalised spectrum per training class as the SAM
+   endmember (`compute_class_endmembers`).
+3. Apply nearest-endmember SAM to all soil-masked pixels.  If
+   `SAM_ANGLE_THRESHOLD` is set, pixels whose minimum angle exceeds the
+   threshold are labelled Unclassified; by default all soil pixels are
+   classified.
+4. Connected-component noise filter (< `MIN_COMPONENT_SIZE` px), matching
+   the library SAM post-processing.
 5. Validation metrics:
-   - Noise fraction per class
+   - Noise fraction per class (pixels removed by size filter)
    - Moran's I spatial clustering (Queen contiguity within soil domain)
-   - MDI feature importances plotted against wavelength
-   - Mean / std of max class probability per mineral
+   - Min-angle statistics: mean and std of the minimum SAM angle per class
+   - Endmember spectra figure saved to `validation/sam_endmember_spectra.png`
 
-**Cross-method comparison:**
-For each mineral class, Jaccard IoU between the RF binary mask and the SAM binary
-mask is computed and saved.  IoU > 0.5 indicates spatial agreement between the
-two independent methods.
+**Cross-method comparison (supervised SAM AMD zone vs library SAM mineral map):**
+
+| Metric | Description |
+|--------|-------------|
+| Jaccard IoU | `(sup_SAM ∩ lib_SAM) / (sup_SAM ∪ lib_SAM)` — spatial overlap |
+| Cohen's Kappa | Chance-corrected binary agreement within soil domain |
+| Library SAM recall | Fraction of library SAM pixels inside supervised SAM zone |
+| Supervised SAM efficiency | Fraction of supervised SAM pixels confirmed by ≥ 1 library mineral |
+| Per-mineral containment | Fraction of each library mineral inside supervised SAM AMD zone |
 
 **Key configuration constants:**
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `RF_N_ESTIMATORS` | 200 | Number of trees |
-| `RF_CLASS_WEIGHT` | `'balanced'` | Weight inversely proportional to class frequency |
-| `PROB_THRESHOLD` | 0.60 | Minimum max probability to accept prediction |
+| `SAM_ANGLE_THRESHOLD` | `None` | Max SAM angle (rad) to accept; `None` = nearest-endmember (no rejection) |
 | `MIN_COMPONENT_SIZE` | 4 | Noise component size threshold (pixels) |
 | `EXCLUDE_BACKGROUND` | `True` | Relabel Background predictions to Unclassified |
-| `CV_FOLDS` | 5 | Number of stratified CV folds |
+| `REFLECTANCE_SCALE` | 10000.0 | Applied if `cube.max() > 2.0` |
 
-**Outputs** (all written to `amd_mapping/outputs/supervised_classification/`):
+**Outputs** (all written to `amd_mapping/outputs/supervised_sam/`):
 
 | File | Description |
 |------|-------------|
-| `rf_classification_map.tif` | GeoTIFF classification map (int16) |
-| `rf_classification_map.hdr/.img` | Same map in ENVI format |
-| `rf_probability_maps.hdr/.img` | Per-class posterior probabilities (float32) |
-| `rf_classification_map.png` | Colour visualisation with legend |
-| `rf_cv_scores.csv` | Balanced accuracy per CV fold |
-| `rf_validation_metrics.csv` | Per-class noise frac, Moran's I, max-prob stats |
-| `rf_cross_method_comparison.csv` | Jaccard IoU: RF vs SAM per mineral class |
-| `validation/rf_feature_importances.csv` | MDI importance per band + wavelength |
-| `validation/rf_feature_importances.png` | Bar chart of top-30 bands by MDI |
+| `sam_classification_map.tif` | GeoTIFF classification map (int16) |
+| `sam_classification_map.hdr/.img` | Same map in ENVI format |
+| `sam_angle_maps.hdr/.img` | Per-class SAM angle maps (float32, radians) |
+| `sam_classification_map.png` | Colour visualisation with legend |
+| `sam_validation_metrics.csv` | Per-class: n_px, noise_frac, mean/std angle, Moran's I |
+| `sam_cross_method_comparison.csv` | Jaccard IoU, Cohen's Kappa, lib-SAM recall, sup-SAM efficiency |
+| `sam_per_mineral_containment.csv` | Per-library-mineral containment in supervised SAM AMD zone |
+| `sam_cross_method_comparison.png` | Two-panel spatial agreement figure |
+| `validation/sam_endmember_spectra.png` | L2-normalised endmember spectra per class |
 
 ---
 
@@ -531,7 +545,3 @@ two independent methods.
 If you use these scripts in research, please cite the original SAM algorithm:
 
 > Kruse, F. A., et al. (1993). The spectral image processing system (SIPS)—interactive visualization and analysis of imaging spectrometer data. Remote sensing of environment, 44(2-3), 145-163.
-
-For the Random Forest classifier:
-
-> Breiman, L. (2001). Random forests. Machine learning, 45(1), 5-32.

@@ -2,7 +2,7 @@
 ## Hyperion AMD Mineral Mapping Project
 
 **Repository:** PROCESSING_AND_POST
-**Last Updated:** February 2026 (v1.3 — supervised classification extension)
+**Last Updated:** February 2026 (v1.4 — supervised SAM replaces Random Forest description)
 **Project:** Remote Sensing - AMD Mineral Detection using Hyperion Hyperspectral Imagery
 
 ---
@@ -283,7 +283,7 @@ magnitude-invariant design principle.
 
 ### [SUPERVISED_CLASSIFICATION.md](changelogs/SUPERVISED_CLASSIFICATION.md)
 **Date:** February 2026
-**Feature:** Supervised Random Forest classification extension — two new scripts
+**Feature:** Supervised SAM classification extension — two new scripts
 (`training_pixel_selector.py`, `supervised_classification.py`) and a pipeline
 orchestration script (`run_pipeline.py`)
 
@@ -292,30 +292,31 @@ orchestration script (`run_pipeline.py`)
   the specific atmospheric/illumination conditions of a given scene.  There is also
   no cross-method validation to confirm that SAM detections are geologically consistent.
 - **Solution:** Added a three-stage supervised workflow that sits on top of the existing
-  SAM pipeline:
+  SAM pipeline.  Both methods use the identical SAM angular similarity logic; they differ
+  only in endmember source:
   1. **`training_pixel_selector.py`** — dark-theme matplotlib GUI; the analyst draws
      rectangular ROIs on three switchable composites (RGB 660/550/480 nm; NIR false
-     colour 850/660/550 nm; Fe³⁺ oxide ratio 900/660 nm).  A live spectral profile
-     panel shows the mean ± 1σ of the current selection and all previously drawn class
-     spectra.  Outputs `training_pixels.npz` (one key per AMD mineral class; value is
-     an int32 (n,2) array of soil-masked pixel indices).
-  2. **`supervised_classification.py`** — trains
-     `RandomForestClassifier(n_estimators=200, class_weight='balanced')` with 5-fold
-     stratified cross-validation; applies it with a 0.60 probability acceptance
-     threshold; filters noise components (< 4 px); computes Moran's I, MDI feature
-     importances, max-probability statistics, and Jaccard IoU cross-comparison with
-     the SAM map.
+     colour 850/660/550 nm; Fe³⁺ oxide ratio 900/660 nm).  Binary classification:
+     `AMD_FeOx` vs `Background`.  A live spectral profile panel shows the mean ± 1σ
+     of the current selection.  Outputs `training_pixels.npz` (one key per class;
+     value is an int32 (n,2) array of soil-masked pixel indices).
+  2. **`supervised_classification.py`** — computes mean L2-normalised spectrum per
+     training class as the SAM endmember; applies nearest-endmember SAM to all soil
+     pixels; filters noise components (< 4 px); computes Moran's I, min-angle
+     statistics, and a cross-method comparison (Jaccard IoU, Cohen's Kappa,
+     per-mineral containment) against the library SAM map.
   3. **`run_pipeline.py`** — thin orchestration wrapper; supports `--stage`,
      `--skip-sam`, and `--skip-select` flags for partial re-runs.
 - **Soil mask fix:** `multi_mineral_sam_fixed.py` now saves `soil_mask.npy` next to
   the reflectance cube so downstream modules do not need to recompute it.
-- **Outputs (RF):** `rf_classification_map.tif` (GeoTIFF), ENVI classification +
-  probability maps, `rf_cv_scores.csv`, `rf_validation_metrics.csv`,
-  `rf_cross_method_comparison.csv`, `validation/rf_feature_importances.{csv,png}`.
+- **Outputs (supervised SAM):** `sam_classification_map.tif` (GeoTIFF), ENVI
+  classification + angle maps, `sam_validation_metrics.csv`,
+  `sam_cross_method_comparison.{csv,png}`, `sam_per_mineral_containment.csv`,
+  `validation/sam_endmember_spectra.png`.
 
-**Key Achievement:** Scene-specific supervised classification that complements the
-endmember-library SAM approach, with Jaccard IoU cross-comparison for spatial
-agreement analysis and a fully interactive training-pixel labelling GUI.
+**Key Achievement:** Scene-specific supervised SAM classification that uses the same
+algorithm as the library SAM stage but with image-derived endmembers, enabling a clean
+method-controlled cross-validation via Jaccard IoU and per-mineral containment metrics.
 
 ---
 
@@ -368,10 +369,10 @@ agreement analysis and a fully interactive training-pixel labelling GUI.
 
 ### For Running the Full Pipeline
 1. Ensure `conda activate hyperion` (or equivalent)
-2. Run `python run_pipeline.py` — executes SAM → training GUI → RF in sequence
-3. For partial re-runs: `python run_pipeline.py --skip-sam --skip-select` (RF only)
+2. Run `python run_pipeline.py` — executes SAM → training GUI → supervised SAM in sequence
+3. For partial re-runs: `python run_pipeline.py --skip-sam --skip-select` (supervised SAM only)
 4. See [SUPERVISED_CLASSIFICATION.md](changelogs/SUPERVISED_CLASSIFICATION.md) for
-   details on the training GUI and RF validation metrics
+   details on the training GUI and supervised SAM validation metrics
 
 ### For Development
 1. Review [INTEGRATION_SUMMARY.md](changelogs/INTEGRATION_SUMMARY.md) for architecture
@@ -401,7 +402,7 @@ agreement analysis and a fully interactive training-pixel labelling GUI.
   - SNAP software compatibility
   - Null-model statistical thresholding
   - Angular spectral inertia validation metric
-  - Supervised RF classification extension (training GUI + pipeline)
+  - Supervised SAM classification extension (training GUI + pipeline)
 
 ---
 
@@ -421,8 +422,8 @@ Map acid mine drainage (AMD) minerals in the Rio Tinto area using Hyperion hyper
 - **Secondary/Confusers:** Kaolinite, Illite, Smectite, Alunite, Gypsum
 
 ### Classification Methods
-- **SAM (Spectral Angle Mapper):** Primary unsupervised classification
-- **Random Forest (supervised):** Scene-specific supervised classification
+- **SAM (Spectral Angle Mapper):** Primary unsupervised classification (library endmembers)
+- **Supervised SAM:** Scene-specific supervised classification (image-derived endmembers)
 - **MTMF (Mixture Tuned Matched Filter):** Abundance and confidence
 - **FCLS (Fully Constrained Least Squares):** Linear unmixing
 
@@ -433,8 +434,8 @@ Map acid mine drainage (AMD) minerals in the Rio Tinto area using Hyperion hyper
 - ✅ SNAP compatibility fixed
 - ✅ Null-model statistical thresholding implemented
 - ✅ Angular spectral inertia validation metric implemented
-- ✅ Supervised RF classification pipeline added (training GUI + RF + cross-validation)
-- ✅ Cross-method SAM ↔ RF Jaccard IoU comparison implemented
+- ✅ Supervised SAM classification pipeline added (training GUI + SAM + cross-validation)
+- ✅ Cross-method library SAM ↔ supervised SAM Jaccard IoU comparison implemented
 - 🔄 Ready for full workflow execution (`python run_pipeline.py`)
 
 ---
@@ -475,6 +476,21 @@ docs/
 ---
 
 ## Version History
+
+- **v1.4** (2026-02-23): Corrected supervised classification description
+  - `README_SAM_MultiMineral.md` — replaced Random Forest section with accurate
+    Supervised SAM description; fixed `--stage rf` → `--stage supervised`; fixed
+    class list (7 mineral classes → binary AMD_FeOx/Background); fixed output folder
+    (`supervised_classification/` → `supervised_sam/`) and file names (`rf_*` → `sam_*`)
+  - `docs/changelogs/SUPERVISED_CLASSIFICATION.md` — full rewrite to reflect actual
+    Supervised SAM implementation (image-derived endmembers, nearest-endmember rule)
+  - `docs/DOCUMENTATION_INDEX.md` — updated classifier description, project status,
+    quick-navigation, and document statistics throughout
+
+- **v1.3** (2026-02-21): Supervised classification extension added
+  - Added `SUPERVISED_CLASSIFICATION.md` changelog
+  - Updated `README_SAM_MultiMineral.md` — added supervised classification extension section
+  - Updated `docs/README.md` and `DOCUMENTATION_INDEX.md`
 
 - **v1.2** (2026-02-21): Angular spectral inertia validation metric
   - Added `ANGULAR_INERTIA_VALIDATION.md` changelog
