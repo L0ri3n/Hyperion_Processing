@@ -577,6 +577,14 @@ def main():
         cube, mineral_spectra, mineral_names,
     )
 
+    # Operative thresholds: null-model where valid, adaptive fallback for NaN
+    operative_thresholds = {
+        name: (null_thresholds[name]
+               if (name in null_thresholds and not np.isnan(null_thresholds[name]))
+               else thresholds[name])
+        for name in mineral_names
+    }
+
     # Compute match scores and statistics
     print(f"\n8. Computing match scores...")
     match_scores_dict = {}
@@ -602,13 +610,13 @@ def main():
         # Save individual map
         if SAVE_INDIVIDUAL_MAPS:
             save_individual_map(match_score, sam_angles, mineral_name,
-                              thr, OUTPUT_FOLDER)
+                              operative_thresholds[mineral_name], OUTPUT_FOLDER)
 
     # Create composite classification map
     if SAVE_COMPOSITE_MAP and len(mineral_names) > 0:
         print("\n9. Creating composite classification map...")
         create_composite_map(sam_angles_dict, match_scores_dict,
-                           mineral_names, thresholds, soil_mask, OUTPUT_FOLDER)
+                           mineral_names, operative_thresholds, soil_mask, OUTPUT_FOLDER)
 
     # Compare adaptive vs null-model thresholds
     print("\n9b. Comparing adaptive vs null-model thresholds...")
@@ -696,6 +704,7 @@ def create_diagnostic_plots(cube, wavelengths, mineral_names, output_folder):
     ax.imshow(rgb)
     ax.set_title('Hyperion RGB Composite (Approximate True Color)', fontsize=13, fontweight='bold')
     ax.axis('off')
+    _add_scale_north_arrow(ax, cols, sb_y=0.04)
     plt.tight_layout()
     plt.savefig(diag_dir / "hyperion_rgb.png", dpi=150, bbox_inches='tight')
     if not SHOW_PLOTS:
@@ -810,6 +819,46 @@ def create_diagnostic_plots(cube, wavelengths, mineral_names, output_folder):
     print(f"     Diagnostic plots saved to: {diag_dir}")
 
 
+def _add_scale_north_arrow(ax, img_cols, pixel_m=30.0, scale_km=5.0, sb_y=0.04,
+                           sb_x0=None):
+    """Overlay a north arrow and a scale bar onto *ax*, both INSIDE the axes.
+
+    Parameters
+    ----------
+    ax       : matplotlib Axes – target axes
+    img_cols : int   – image width in pixels, used to size the scale bar
+    pixel_m  : float – ground-sampling distance in m/pixel (30 for Hyperion)
+    scale_km : float – desired scale-bar length in km (default 5)
+    sb_y     : float – axes-fraction y of the scale bar bottom edge.
+                       Set just above the legend box top when a legend is present.
+    sb_x0    : float or None – axes-fraction x of the scale bar left edge.
+                       None (default) anchors to the lower-right corner;
+                       pass e.g. 0.02 to anchor to the lower-left (above legend).
+    """
+    from matplotlib.patches import Rectangle
+
+    _scale_xfrac = (scale_km * 1000.0 / pixel_m) / img_cols
+
+    # North arrow — upper-right corner
+    _ax, _ay0, _ay1 = 0.93, 0.87, 0.97
+    ax.annotate('', xy=(_ax, _ay1), xycoords='axes fraction',
+                xytext=(_ax, _ay0), textcoords='axes fraction',
+                arrowprops=dict(arrowstyle='->', color='black', lw=1.5))
+    ax.text(_ax, _ay1 + 0.01, 'N', transform=ax.transAxes,
+            ha='center', va='bottom', fontsize=8, fontweight='bold', color='black')
+
+    # Scale bar — anchored left or right depending on sb_x0
+    _sb_x0 = (0.97 - _scale_xfrac) if sb_x0 is None else sb_x0
+    _sb_h  = 0.007
+    ax.add_patch(Rectangle((_sb_x0, sb_y), _scale_xfrac, _sb_h,
+                            transform=ax.transAxes,
+                            color='black', zorder=5))
+    ax.text(_sb_x0 + _scale_xfrac / 2, sb_y + _sb_h * 2.5,
+            f'{scale_km:g} km',
+            ha='center', va='bottom', transform=ax.transAxes,
+            fontsize=6.5, color='black', zorder=5)
+
+
 def save_soil_mask_plot(soil_mask, ndvi, mndwi, output_folder):
     """Save publication-quality pre-classification soil mask figure."""
     from matplotlib.patches import Patch
@@ -886,10 +935,10 @@ def save_soil_mask_plot(soil_mask, ndvi, mndwi, output_folder):
         Patch(facecolor=(0.20, 0.60, 0.20), edgecolor='k', linewidth=0.4, label='Vegetation'),
         Patch(facecolor=(0.20, 0.40, 0.75), edgecolor='k', linewidth=0.4, label='Water'),
     ]
-    ax.legend(handles=legend_patches, loc='upper center',
-              bbox_to_anchor=(0.5, -0.01), fontsize=7,
+    ax.legend(handles=legend_patches, loc='lower right',
+              fontsize=7,
               frameon=True, fancybox=False, edgecolor='0.4',
-              handlelength=1.2, handleheight=0.9, ncol=3)
+              handlelength=1.2, handleheight=0.9, ncol=1)
 
     # ---- (d) Final soil mask (binary) ----
     ax = axes[1, 1]
@@ -914,10 +963,13 @@ def save_soil_mask_plot(soil_mask, ndvi, mndwi, output_folder):
         Patch(facecolor=(0.55, 0.37, 0.24), edgecolor='k', linewidth=0.4, label='Soil'),
         Patch(facecolor=(0.85, 0.85, 0.85), edgecolor='k', linewidth=0.4, label='Excluded'),
     ]
-    ax.legend(handles=legend_patches_d, loc='upper center',
-              bbox_to_anchor=(0.5, -0.01), fontsize=7,
+    ax.legend(handles=legend_patches_d, loc='lower right',
+              fontsize=7,
               frameon=True, fancybox=False, edgecolor='0.4',
-              handlelength=1.2, handleheight=0.9, ncol=2)
+              handlelength=1.2, handleheight=0.9, ncol=1)
+
+    # Cartographic elements — one set for the whole composite, on panel (d)
+    _add_scale_north_arrow(ax, soil_mask.shape[1], sb_y=0.15)
 
     out_path = diag_dir / "pre_classification_soil_mask.png"
     plt.savefig(out_path, dpi=300, bbox_inches='tight', facecolor='white')
@@ -974,9 +1026,13 @@ def save_individual_map(match_score, sam_angles, mineral_name, threshold, output
             Patch(fc=(0.13, 0.55, 0.13), ec='0.3', lw=0.4, label='Detected'),
             Patch(fc=(0.85, 0.85, 0.85), ec='0.3', lw=0.4, label='Not detected'),
         ],
-        loc='lower right', fontsize=7,
+        loc='lower right',
+        fontsize=7, ncol=1,
         frameon=True, fancybox=False, edgecolor='0.4',
         handlelength=1.0, handleheight=0.8)
+
+    # Cartographic elements — one set for the composite figure, on the primary panel
+    _add_scale_north_arrow(ax2, sam_angles.shape[1], sb_y=0.13)
 
     plt.tight_layout()
     output_path = Path(output_folder) / f"{mineral_name}_SAM_results.png"
@@ -1041,7 +1097,7 @@ def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thre
     # =====================================================================
     # Publication-quality visualization
     # =====================================================================
-    from matplotlib.patches import Patch, Rectangle
+    from matplotlib.patches import Patch
     import matplotlib.gridspec as gridspec
 
     mineral_rgb = MINERAL_COLORS
@@ -1088,33 +1144,14 @@ def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thre
             Patch(fc=c, ec='0.3', lw=0.4, label=short_name))
 
     ax_class.legend(handles=legend_elements,
-                    loc='lower right', fontsize=6.5,
+                    loc='lower right',
+                    fontsize=6.5, ncol=1,
                     frameon=True, fancybox=False, edgecolor='0.4',
                     handlelength=1.0, handleheight=0.8,
                     borderpad=0.4, labelspacing=0.35)
 
-    # --- North arrow (upper-right, axes coordinates; image is north-up) ---
-    ax_class.annotate('', xy=(0.93, 0.96), xycoords='axes fraction',
-                      xytext=(0.93, 0.86), textcoords='axes fraction',
-                      arrowprops=dict(arrowstyle='->', color='black', lw=1.5))
-    ax_class.text(0.93, 0.97, 'N', transform=ax_class.transAxes,
-                  ha='center', va='bottom', fontsize=8, fontweight='bold', color='black')
-
-    # --- 5 km scale bar (axes coordinates, above legend; Hyperion = 30 m/pixel) ---
-    _PIXEL_M    = 30.0
-    _scale_px   = 5000.0 / _PIXEL_M          # ~167 px in data units
-    _scale_xfrac = _scale_px / cols           # bar width as fraction of axes width
-    # Right-align at x=0.97, just above the legend box (~y=0.35 from bottom)
-    _sb_x0 = 0.97 - _scale_xfrac
-    _sb_y  = 0.35
-    _sb_h  = 0.007                            # bar thickness in axes fraction
-    ax_class.add_patch(Rectangle((_sb_x0, _sb_y), _scale_xfrac, _sb_h,
-                                 transform=ax_class.transAxes,
-                                 color='black', zorder=5, clip_on=False))
-    ax_class.text(_sb_x0 + _scale_xfrac / 2, _sb_y + _sb_h * 2.5,
-                  '5 km', ha='center', va='bottom',
-                  transform=ax_class.transAxes,
-                  fontsize=6.5, color='black', zorder=5)
+    # Cartographic elements — above the legend at lower-right
+    _add_scale_north_arrow(ax_class, cols, sb_y=0.14)
 
     # (b) Minimum SAM angle — soil pixels only
     ax_sam = fig.add_subplot(gs[0, 1])
@@ -1344,60 +1381,77 @@ def _compute_morans_i(binary_mask, soil_r, soil_c,
     return I, z, p, sig
 
 
-def _save_validation_figure(name, short, soil_mask,
-                             binary_mask, labeled, comp_sizes,
-                             noise_px_mask, n_components, noise_px_frac,
-                             n_noise_comps,
-                             hist, bin_edges, bin_centers,
-                             mean_a, std_a, skewness, dist_quality,
-                             thr, val_dir,
-                             null_thr=None, null_angles=None):
-    """Save a two-panel validation figure per mineral.
+def _save_angle_distribution_figure(name, short, angles_cls,
+                                     mean_a, std_a, skewness, dist_quality,
+                                     thr, val_dir,
+                                     null_angles=None):
+    """Save per-mineral SAM angle distribution histogram as a standalone figure.
 
-    Left panel  – SAM angle histogram (30 bins, [0, threshold]) with mean
-                  and ±1σ markers.
-    Right panel – Labeled connected-component map coloured by log(size),
-                  with noise components overlaid in red.
+    X-axis is restricted to the range of the classified pixels (±1.5° padding).
+    Bin width is fixed at 0.1° for physical interpretability.
+
+    Parameters
+    ----------
+    angles_cls  : 1-D ndarray (radians) — SAM angles at classified pixels
+    mean_a, std_a : float (radians)
+    skewness    : float
+    dist_quality : str — human-readable quality label
+    thr         : float (radians) — null-model threshold (operative)
+    null_thr    : float or None (radians) — null-model threshold (pass None if
+                  unavailable or invalid)
+    null_angles : ndarray or None (radians) — background null distribution
     """
-    fig, (ax_hist, ax_map) = plt.subplots(1, 2, figsize=(13, 5.5))
+    # ── null-distribution availability ────────────────────────────────────
+    _has_null  = (null_angles is not None and len(null_angles) > 0)
 
-    # ── Left: SAM angle histogram with optional null-model overlay ────────
-    _has_null = (null_thr is not None and null_angles is not None
-                 and len(null_angles) > 0 and not np.isnan(null_thr))
-    display_max = max(thr, null_thr) * 1.05 if _has_null else thr
+    # ── histogram: fixed 0.1° bin width, data-driven x-axis ──────────────
+    BIN_W_RAD = np.radians(0.1)
+    PAD_RAD   = np.radians(1.5)
 
-    # Null-model background distribution (plotted first, sits behind)
+    if len(angles_cls) >= 2:
+        x_min = max(0.0, float(angles_cls.min()) - PAD_RAD)
+        x_max = float(angles_cls.max()) + PAD_RAD
+    else:
+        x_min = 0.0
+        x_max = float(thr) + PAD_RAD
+
+    n_bins = max(1, int(np.ceil((x_max - x_min) / BIN_W_RAD)))
+    if n_bins > 500:                        # safety cap
+        BIN_W_RAD = (x_max - x_min) / 500
+        n_bins    = 500
+
+    hist, bin_edges = np.histogram(angles_cls, bins=n_bins, range=(x_min, x_max))
+    bin_centers     = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    fig, ax_hist = plt.subplots(figsize=(7.5, 5.5))
+
+    # ── Null-model overlay (only angles inside the restricted x range) ────
     if _has_null:
-        null_hist_vals, null_bin_edges = np.histogram(
-            null_angles, bins=30, range=(0.0, float(display_max)))
-        null_centers  = 0.5 * (null_bin_edges[:-1] + null_bin_edges[1:])
-        null_bin_w_d  = np.degrees(null_bin_edges[1] - null_bin_edges[0])
-        # Scale null histogram so its peak sits at 60% of classified histogram peak
-        peak_cls  = float(hist.max())  if hist.max()           > 0 else 1.0
-        peak_null = float(null_hist_vals.max()) if null_hist_vals.max() > 0 else 1.0
-        scale     = peak_cls * 0.6 / peak_null
-        ax_hist.bar(np.degrees(null_centers), null_hist_vals * scale,
-                    width=null_bin_w_d * 0.88,
-                    color='#AAAAAA', edgecolor='white', linewidth=0.3,
-                    alpha=0.60, zorder=2,
-                    label=f'Null/background (n={len(null_angles):,}, scaled)')
+        null_in = null_angles[(null_angles >= x_min) & (null_angles <= x_max)]
+        if len(null_in) >= 1:
+            nh, ne = np.histogram(null_in, bins=n_bins, range=(x_min, x_max))
+            nc     = 0.5 * (ne[:-1] + ne[1:])
+            nw_d   = np.degrees(ne[1] - ne[0])
+            peak_c = float(hist.max()) if hist.max() > 0 else 1.0
+            peak_n = float(nh.max())   if nh.max()   > 0 else 1.0
+            ax_hist.bar(np.degrees(nc), nh * (peak_c * 0.6 / peak_n),
+                        width=nw_d * 0.88,
+                        color='#AAAAAA', edgecolor='white', linewidth=0.3,
+                        alpha=0.60, zorder=2,
+                        label=f'Null/background (n={len(null_angles):,}, scaled)')
 
-    # Classified pixel angle distribution
-    bin_w_deg = np.degrees(bin_edges[1] - bin_edges[0])
+    # ── Classified pixel distribution ─────────────────────────────────────
+    bw_d = np.degrees(bin_edges[1] - bin_edges[0])
     ax_hist.bar(np.degrees(bin_centers), hist,
-                width=bin_w_deg * 0.88,
+                width=bw_d * 0.88,
                 color='#3A7ABF', edgecolor='white', linewidth=0.3,
                 zorder=3,
                 label=f'Classified pixels (n={int(hist.sum()):,})')
 
-    # Threshold vertical lines
+    # ── Threshold and statistics lines ────────────────────────────────────
     ax_hist.axvline(np.degrees(thr),
-                    color='#9467BD', linestyle='--', linewidth=1.5, zorder=4,
-                    label=f'Adaptive thr = {np.degrees(thr):.2f}\u00b0')
-    if _has_null:
-        ax_hist.axvline(np.degrees(null_thr),
-                        color='#2CA02C', linestyle='-.', linewidth=1.5, zorder=4,
-                        label=f'Null thr = {np.degrees(null_thr):.2f}\u00b0')
+                    color='#2CA02C', linestyle='--', linewidth=1.5, zorder=4,
+                    label=f'Null-model thr = {np.degrees(thr):.2f}\u00b0')
     ax_hist.axvline(np.degrees(mean_a),
                     color='#D62728', linestyle='--', linewidth=1.5,
                     label=f'Mean = {np.degrees(mean_a):.2f}\u00b0')
@@ -1405,6 +1459,7 @@ def _save_validation_figure(name, short, soil_mask,
         ax_hist.axvline(np.degrees(mean_a + sign * std_a),
                         color='#FF7F0E', linestyle=':', linewidth=1.2,
                         label='\u00b11\u03c3' if sign == -1 else None)
+
     ax_hist.set_xlabel('SAM Angle (\u00b0)', fontsize=11)
     ax_hist.set_ylabel('Pixel Count', fontsize=11)
     ax_hist.set_title(
@@ -1413,28 +1468,41 @@ def _save_validation_figure(name, short, soil_mask,
         fontsize=10)
     ax_hist.legend(fontsize=8)
     ax_hist.grid(True, alpha=0.25)
-    ax_hist.set_xlim(0, np.degrees(display_max))
+    ax_hist.set_xlim(np.degrees(x_min), np.degrees(x_max))
 
-    # ── Right: component size map ─────────────────────────────────────────
-    # Base layer: white = nodata, light-gray = soil domain
+    plt.tight_layout()
+    safe = name.replace(' ', '_').replace('(', '').replace(')', '')
+    fig_path = val_dir / f"{safe}_angle_distribution.png"
+    plt.savefig(fig_path, dpi=200, bbox_inches='tight', facecolor='white')
+    if not SHOW_PLOTS:
+        plt.close()
+
+
+def _save_spatial_map_figure(name, short, soil_mask,
+                              binary_mask, labeled, comp_sizes,
+                              noise_px_mask, n_components, noise_px_frac,
+                              n_noise_comps, val_dir):
+    """Save per-mineral connected-component spatial map as a standalone figure."""
+    _vmax = float(np.log1p(comp_sizes.max())) if len(comp_sizes) > 0 else 1.0
+
+    fig, ax_map = plt.subplots(figsize=(5.5, 7.5))
+    ax_map.set_facecolor('white')
+
     base = np.ones((*binary_mask.shape, 3), dtype=np.float32)
     base[soil_mask] = [0.88, 0.88, 0.88]
     ax_map.imshow(base, interpolation='nearest')
 
-    # Component size in log scale for wide dynamic range
     comp_size_map = np.zeros_like(binary_mask, dtype=np.float64)
     for comp_id, size in enumerate(comp_sizes, start=1):
         comp_size_map[labeled == comp_id] = float(size)
 
     display = np.ma.masked_where(~binary_mask, np.log1p(comp_size_map))
-    max_log  = float(np.log1p(comp_sizes.max())) if len(comp_sizes) > 0 else 1.0
     im = ax_map.imshow(display, cmap='viridis', interpolation='nearest',
-                       vmin=0, vmax=max_log)
+                       vmin=0, vmax=_vmax)
     cbar = plt.colorbar(im, ax=ax_map, fraction=0.046, pad=0.04)
     cbar.set_label('log(1 + component size)  [px]', fontsize=8)
     cbar.ax.tick_params(labelsize=7)
 
-    # Noise overlay (semi-transparent red)
     if noise_px_mask.any():
         noise_rgba = np.zeros((*binary_mask.shape, 4), dtype=np.float32)
         noise_rgba[noise_px_mask] = [0.85, 0.10, 0.10, 0.70]
@@ -1446,11 +1514,109 @@ def _save_validation_figure(name, short, soil_mask,
         f'{noise_px_frac * 100:.1f}% of classified pixels',
         fontsize=10)
     ax_map.axis('off')
+    _add_scale_north_arrow(ax_map, binary_mask.shape[1], sb_y=0.04)
 
     plt.tight_layout()
     safe = name.replace(' ', '_').replace('(', '').replace(')', '')
-    fig_path = val_dir / f"{safe}_validation.png"
+    fig_path = val_dir / f"{safe}_spatial_map.png"
     plt.savefig(fig_path, dpi=200, bbox_inches='tight', facecolor='white')
+    if not SHOW_PLOTS:
+        plt.close()
+
+
+def _save_composite_spatial_map(mineral_spatial_data, val_dir):
+    """Save composite figure of all mineral spatial maps (1 row × n_minerals columns).
+
+    All panels share the same log(component-size) colour scale so that relative
+    cluster sizes are visually comparable across minerals.
+
+    Parameters
+    ----------
+    mineral_spatial_data : list of dict
+        Each dict: name, short, soil_mask, binary_mask, labeled, comp_sizes,
+                   noise_px_mask, n_components, noise_px_frac, n_noise_comps
+    val_dir : Path
+    """
+    n = len(mineral_spatial_data)
+    if n == 0:
+        return
+
+    # Global log_vmax for consistent colour scale
+    global_vmax = max(
+        (float(np.log1p(d['comp_sizes'].max())) if len(d['comp_sizes']) > 0 else 0.0)
+        for d in mineral_spatial_data
+    )
+    global_vmax = max(global_vmax, 1.0)
+
+    # Derive panel width from the image's own aspect ratio so that each axes
+    # box exactly fits its image — eliminating internal horizontal whitespace.
+    _img_rows, _img_cols = mineral_spatial_data[0]['binary_mask'].shape
+    _panel_h  = 7.0
+    _panel_w  = max(1.2, _panel_h * _img_cols / _img_rows)
+    _gap_in   = 0.30                             # inter-panel gap (inches)
+    _cbar_res = 1.8                              # inches reserved for colorbar strip
+    _fig_w    = _panel_w * n + _gap_in * (n - 1) + _cbar_res
+
+    fig, axes = plt.subplots(1, n, figsize=(_fig_w, _panel_h))
+    if n == 1:
+        axes = [axes]
+
+    im_ref = None
+    for ax, d in zip(axes, mineral_spatial_data):
+        ax.set_facecolor('white')
+
+        base = np.ones((*d['binary_mask'].shape, 3), dtype=np.float32)
+        base[d['soil_mask']] = [0.88, 0.88, 0.88]
+        ax.imshow(base, interpolation='nearest')
+
+        comp_size_map = np.zeros_like(d['binary_mask'], dtype=np.float64)
+        for comp_id, size in enumerate(d['comp_sizes'], start=1):
+            comp_size_map[d['labeled'] == comp_id] = float(size)
+
+        display = np.ma.masked_where(~d['binary_mask'], np.log1p(comp_size_map))
+        im_ref = ax.imshow(display, cmap='viridis', interpolation='nearest',
+                           vmin=0, vmax=global_vmax)
+
+        if d['noise_px_mask'].any():
+            noise_rgba = np.zeros((*d['binary_mask'].shape, 4), dtype=np.float32)
+            noise_rgba[d['noise_px_mask']] = [0.85, 0.10, 0.10, 0.70]
+            ax.imshow(noise_rgba, interpolation='nearest')
+
+        ax.set_title(
+            f"{d['short']}\n"
+            f"n={d['n_components']} | {d['noise_px_frac'] * 100:.1f}% noise",
+            fontsize=7.5, fontweight='bold')
+        ax.axis('off')
+
+    # Cartographic elements — one set for the composite, on the rightmost panel
+    # (horizontal 1×N layout: placed beside/above the colorbar strip)
+    _add_scale_north_arrow(axes[-1],
+                           mineral_spatial_data[-1]['binary_mask'].shape[1], sb_y=0.04)
+
+    # Manual layout — axes group fills the left portion; colorbar sits in the
+    # reserved strip on the right.  All positions are in figure coordinates.
+    _L = 0.005
+    _R = (_panel_w * n + _gap_in * (n - 1)) / _fig_w   # right edge of axes group
+    _B, _T = 0.02, 0.91
+    # wspace as fraction of average axes width so total gap = _gap_in * (n-1)
+    _wspace = _gap_in / _panel_w if n > 1 else 0.0
+    fig.subplots_adjust(left=_L, right=_R, bottom=_B, top=_T, wspace=_wspace)
+
+    # Colorbar: 0.25" gap + 0.12" bar, expressed as figure fractions
+    cbar_ax = fig.add_axes([_R + 0.25 / _fig_w, _B + 0.05,
+                            0.12 / _fig_w,        (_T - _B) - 0.08])
+    cbar = fig.colorbar(im_ref, cax=cbar_ax)
+    cbar.set_label('log(1 + component size)  [px]', fontsize=9)
+    cbar.ax.tick_params(labelsize=8)
+
+    # Title centred over the axes group
+    fig.suptitle('SAM Classification \u2014 Connected-Component Spatial Maps',
+                 fontsize=11, fontweight='bold',
+                 x=(_L + _R) / 2, y=0.975)
+
+    fig_path = val_dir / "validation_spatial_maps_composite.png"
+    plt.savefig(fig_path, dpi=200, bbox_inches='tight', facecolor='white')
+    print(f"     Composite spatial map saved: {fig_path.name}")
     if not SHOW_PLOTS:
         plt.close()
 
@@ -1472,8 +1638,9 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
     2. SAM angle distribution
        Extracts spectral-angle values at classified pixel locations from the
        rule image and builds a 30-bin histogram over [0, threshold_angle].
-       Reports: mean_angle, std_angle, skewness (left-skewed toward zero =
-       good signal; flat/right-skewed = noisy classification).
+       Reports: mean_angle, std_angle, skewness (descriptive only: left-skewed
+       is structurally expected due to upper truncation at the threshold and
+       the rarity of near-zero-angle pixels in any real scene).
 
     3. Angular spectral inertia
        Compares the distribution of per-pixel SAM angles at classified
@@ -1579,10 +1746,15 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
     print("POST-CLASSIFICATION VALIDATION")
     print("=" * 70)
 
+    _mineral_spatial_data = []   # collects per-mineral spatial data for composite
+
     for name in mineral_names:
         short      = short_mineral_name(name)
-        thr        = thresholds[name]
         sam_angles = sam_angles_dict[name]
+
+        # Operative threshold: null-model if valid, adaptive fallback for NaN
+        _nt = null_thresholds.get(name, np.nan) if null_thresholds else np.nan
+        thr = _nt if not np.isnan(_nt) else thresholds[name]
 
         # Binary mask: classified AND within soil domain
         binary_mask  = (sam_angles < thr) & soil_mask
@@ -1647,8 +1819,6 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
 
         # ── 2. SAM angle distribution ─────────────────────────────────────
         angles_cls = sam_angles[binary_mask]   # all in [0, thr)
-        hist, bin_edges = np.histogram(angles_cls, bins=30, range=(0.0, thr))
-        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
 
         mean_a = float(np.mean(angles_cls))
         std_a  = float(np.std(angles_cls))
@@ -1656,9 +1826,9 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
                     if std_a > 1e-12 else 0.0)
 
         if skewness < -0.3:
-            dist_quality = "left-skewed \u2192 good signal"
+            dist_quality = "left-skewed"
         elif skewness > 0.3:
-            dist_quality = "right-skewed \u2192 noisy"
+            dist_quality = "right-skewed"
         else:
             dist_quality = "symmetric"
 
@@ -1773,26 +1943,49 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
 
         summary_rows.append(row)
 
-        # ── Validation figure ─────────────────────────────────────────────
-        # Prefer the angular-inertia null distribution for the histogram
-        # overlay (same background population, correct endmember angles).
-        # Fall back to null_angles_dist from derive_null_thresholds when
-        # mineral_spectra was not provided.
+        # ── Per-mineral angle distribution figure ─────────────────────────
+        # Use angular-inertia null distribution when available (same background
+        # population, correct endmember angles); fall back to
+        # null_angles_dist from derive_null_thresholds otherwise.
         _fig_null_angles = (_angles_null_ai
                             if _angles_null_ai is not None
                             else (null_angles_dist if _null_valid else None))
-        _save_validation_figure(
-            name, short, soil_mask,
-            binary_mask, labeled, comp_sizes,
-            noise_px_mask, n_components, noise_px_frac, n_noise_comps,
-            hist, bin_edges, bin_centers,
+        _save_angle_distribution_figure(
+            name, short, angles_cls,
             mean_a, std_a, skewness, dist_quality,
             thr, val_dir,
-            null_thr=null_thr if _null_valid else None,
             null_angles=_fig_null_angles,
         )
         safe = name.replace(' ', '_').replace('(', '').replace(')', '')
-        print(f"     Figure saved: {safe}_validation.png")
+        print(f"     Figure saved: {safe}_angle_distribution.png")
+
+        # Collect spatial data for per-mineral and composite spatial maps
+        _mineral_spatial_data.append({
+            'name':          name,
+            'short':         short,
+            'soil_mask':     soil_mask,
+            'binary_mask':   binary_mask,
+            'labeled':       labeled,
+            'comp_sizes':    comp_sizes,
+            'noise_px_mask': noise_px_mask,
+            'n_components':  n_components,
+            'noise_px_frac': noise_px_frac,
+            'n_noise_comps': n_noise_comps,
+        })
+
+    # ── Spatial map figures (per-mineral + composite) ──────────────────────
+    for _d in _mineral_spatial_data:
+        _save_spatial_map_figure(
+            _d['name'], _d['short'], _d['soil_mask'],
+            _d['binary_mask'], _d['labeled'], _d['comp_sizes'],
+            _d['noise_px_mask'], _d['n_components'], _d['noise_px_frac'],
+            _d['n_noise_comps'], val_dir,
+        )
+        _safe = _d['name'].replace(' ', '_').replace('(', '').replace(')', '')
+        print(f"     Figure saved: {_safe}_spatial_map.png")
+
+    if _mineral_spatial_data:
+        _save_composite_spatial_map(_mineral_spatial_data, val_dir)
 
     # ── Summary table ─────────────────────────────────────────────────────
     print("\n" + "=" * 70)

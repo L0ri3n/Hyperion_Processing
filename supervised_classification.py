@@ -117,7 +117,7 @@ CLASS_COLORS = {
 # If None, all soil pixels are classified using the nearest-endmember rule
 # (i.e. every soil pixel is assigned to its closest class endmember).
 # Set to e.g. np.pi / 4 (≈ 45°) to reject spectrally ambiguous pixels.
-SAM_ANGLE_THRESHOLD = None
+SAM_ANGLE_THRESHOLD = 0.5
 
 # Alias kept for any code that still references the old constant name.
 SAM_SUPERVISED_OUTPUT_FOLDER = OUTPUT_FOLDER
@@ -754,6 +754,42 @@ def save_sam_supervised_outputs(class_map, angle_maps, class_names, output_dir):
     _save_sam_supervised_figure(class_map, class_names, output_dir)
 
 
+def _add_scale_north_arrow(ax, img_cols, pixel_m=30.0, scale_km=5.0, sb_y=0.04):
+    """Overlay a north arrow and a scale bar onto *ax*, both INSIDE the axes.
+
+    Parameters
+    ----------
+    ax       : matplotlib Axes – target axes
+    img_cols : int   – image width in pixels, used to size the scale bar
+    pixel_m  : float – ground-sampling distance in m/pixel (30 for Hyperion)
+    scale_km : float – desired scale-bar length in km (default 5)
+    sb_y     : float – axes-fraction y of the scale bar bottom edge.
+                       Set just above the legend box top when a legend is present.
+    """
+    from matplotlib.patches import Rectangle
+
+    _scale_xfrac = (scale_km * 1000.0 / pixel_m) / img_cols
+
+    # North arrow — upper-right corner
+    _ax, _ay0, _ay1 = 0.93, 0.87, 0.97
+    ax.annotate('', xy=(_ax, _ay1), xycoords='axes fraction',
+                xytext=(_ax, _ay0), textcoords='axes fraction',
+                arrowprops=dict(arrowstyle='->', color='black', lw=1.5))
+    ax.text(_ax, _ay1 + 0.01, 'N', transform=ax.transAxes,
+            ha='center', va='bottom', fontsize=8, fontweight='bold', color='black')
+
+    # Scale bar — lower-right corner, above the legend
+    _sb_x0 = 0.97 - _scale_xfrac
+    _sb_h  = 0.007
+    ax.add_patch(Rectangle((_sb_x0, sb_y), _scale_xfrac, _sb_h,
+                            transform=ax.transAxes,
+                            color='black', zorder=5))
+    ax.text(_sb_x0 + _scale_xfrac / 2, sb_y + _sb_h * 2.5,
+            f'{scale_km:g} km',
+            ha='center', va='bottom', transform=ax.transAxes,
+            fontsize=6.5, color='black', zorder=5)
+
+
 def _save_sam_supervised_figure(class_map, class_names, output_dir):
     """Save a colour visualisation of the supervised SAM classification map."""
     from matplotlib.patches import Patch
@@ -792,10 +828,14 @@ def _save_sam_supervised_figure(class_map, class_names, output_dir):
             Patch(fc=c, ec="0.3", lw=0.4, label=cls_name.replace("_", " "))
         )
     ax.legend(
-        handles=legend_elements, loc="lower right", fontsize=8,
+        handles=legend_elements,
+        loc="lower right",
+        fontsize=8, ncol=2,
         frameon=True, fancybox=False, edgecolor="0.4",
         handlelength=1.2, handleheight=0.9,
     )
+
+    _add_scale_north_arrow(ax, class_map.shape[1], sb_y=0.12)
 
     plt.tight_layout()
     fig_path = output_dir / "sam_classification_map.png"
@@ -1126,9 +1166,13 @@ def _save_sam_cross_method_figure(sup_amd, lib_any, per_mineral,
               label="Neither / non-soil"),
     ]
     ax_map.legend(
-        handles=legend_elements, loc="lower right", fontsize=8.5,
+        handles=legend_elements,
+        loc="lower right",
+        fontsize=8.5, ncol=2,
         frameon=True, fancybox=False, edgecolor="0.4",
     )
+
+    _add_scale_north_arrow(ax_map, cols, sb_y=0.15)
 
     # ── Right: per-mineral containment bar chart ──────────────────────────
     ax_bar = axes[1]
