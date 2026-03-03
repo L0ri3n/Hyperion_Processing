@@ -55,6 +55,10 @@ SHOW_PLOTS = False
 # Post-classification validation
 # Connected components with fewer pixels than this are flagged as noise.
 MIN_COMPONENT_SIZE = 4
+# Hodges–Lehmann estimator: max pixels per group for pairwise computation.
+# Both classified and null angle arrays are subsampled to this cap before
+# the O(n²) pairwise matrix is formed.  seed=42 ensures reproducibility.
+HL_SUBSAMPLE = 1000
 
 # =============================================================================
 # HELPERS
@@ -1787,8 +1791,8 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
                 "Components": 0, "Noise_comps": 0, "Noise_px_frac": np.nan,
                 "Mean_angle_deg": np.nan, "Std_angle_deg": np.nan,
                 "Skewness": np.nan, "Dist_quality": "N/A",
-                "Mean_angle_cls_deg": np.nan, "Mean_angle_null_deg": np.nan,
                 "Angular_inertia_ratio": np.nan,
+                "HL_shift_deg": np.nan,
                 "MannWhitney_p": np.nan, "Effect_size": np.nan,
                 "Morans_I": np.nan, "Morans_z": np.nan,
                 "Morans_p": np.nan, "Morans_sig": "N/A",
@@ -1844,65 +1848,99 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
             "Dist_quality":   dist_quality,
         })
 
-        # ── 3. Angular spectral inertia ───────────────────────────────────
-        # Compare α_classified (SAM angles at classified pixels) against
-        # α_null (SAM angles of random background soil vs same endmember).
-        # Ratio = mean(α_cls) / mean(α_null): < 1 → classified pixels are
-        # on average more similar to the endmember than background soil.
-        # Mann-Whitney U (one-sided, H1: α_cls < α_null) quantifies whether
-        # this separation is statistically significant.
-        # Effect size r = 1 − 2U/(n1·n2): +1 → classified << null (good).
-        mean_cls_deg = mean_null_deg = ang_ratio = mwu_p = effect_r = np.nan
+        # ── 3. Geodesic angular inertia ───────────────────────────────────
+        # Fréchet mean of classified pixels on the unit hypersphere is used
+        # as the shared reference direction for both inertia calculations.
+        # Geodesic inertia = sum of squared arccos distances to that mean.
+        # Ratio = inertia(cls) / inertia(null): < 1 → classified pixels are
+        # more tightly clustered around their own centroid than background.
+        # HL estimator: median of (α_null_j − α_cls_i) pairwise differences,
+        # subsampled to HL_SUBSAMPLE per group for memory efficiency.
+        ang_ratio = mwu_p = effect_r = hl_shift_deg = np.nan
         _angles_null_ai = None
 
         if _ai_bg_spectra is not None and n_classified >= 2:
-            endmember = mineral_spectra[name]          # unit-normalised
-            _cos_null  = (_ai_bg_spectra @ endmember) / _ai_bg_norms
-            _cos_null  = np.clip(_cos_null, -1.0, 1.0)
-            _angles_null_ai = np.arccos(_cos_null)
+            # -- classified spectra on unit hypersphere
+            cls_r, cls_c = np.where(binary_mask)
+            cls_spectra = cube[cls_r, cls_c, :].astype(np.float64)
+            _impute_nan_bands(cls_spectra)
+            _cls_norms = np.linalg.norm(cls_spectra, axis=1, keepdims=True)
+            _cls_norms = np.where(_cls_norms == 0, 1e-10, _cls_norms)
+            cls_spectra_unit = cls_spectra / _cls_norms
 
-            _mean_cls_rad  = float(np.mean(angles_cls))
-            _mean_null_rad = float(np.mean(_angles_null_ai))
-            mean_cls_deg   = float(np.degrees(_mean_cls_rad))
-            mean_null_deg  = float(np.degrees(_mean_null_rad))
-            ang_ratio      = (_mean_cls_rad / _mean_null_rad
-                              if _mean_null_rad > 0 else np.nan)
+            # -- Fréchet mean: arithmetic mean of unit vectors, re-normalised
+            _mean_vec  = cls_spectra_unit.mean(axis=0)
+            _mean_norm = np.linalg.norm(_mean_vec)
 
-            # One-sided Mann-Whitney: H1 = classified angles stochastically
-            # less than null angles.  U counts (cls_i < null_j) pairs.
-            # Small U → large p; large U → small p (supports H1).
-            _U, mwu_p = mannwhitneyu(angles_cls, _angles_null_ai,
-                                     alternative='less')
-            n1, n2   = len(angles_cls), len(_angles_null_ai)
-            # Rank-biserial r: +1 = all classified < all null (perfect)
-            #                   0 = no difference
-            #                  -1 = all classified > all null (inverted)
-            effect_r = 1.0 - (2.0 * _U) / (n1 * n2)
+            if _mean_norm < 1e-12:
+                print("     [3] Geodesic angular inertia: "
+                      "degenerate mean direction — skipped.")
+            else:
+                frechet_mean_cls = _mean_vec / _mean_norm
 
-            _coherence = "< null (good)" if ang_ratio < 1.0 else ">= null (poor)"
-            print(f"     [3] Angular inertia:")
-            print(f"         mean(classified) = {mean_cls_deg:.3f}\u00b0,  "
-                  f"mean(null) = {mean_null_deg:.3f}\u00b0,  "
-                  f"ratio = {ang_ratio:.4f}  ({_coherence})")
-            print(f"         Mann-Whitney p = {mwu_p:.4e},  "
-                  f"effect size r = {effect_r:.4f}")
+                # -- null spectra on unit hypersphere
+                null_spectra_unit = (_ai_bg_spectra
+                                     / _ai_bg_norms[:, np.newaxis])
+
+                # -- geodesic inertia: sum of squared arccos distances
+                def _geodesic_inertia(unit_spectra, ref):
+                    cos_a = np.clip(unit_spectra @ ref, -1.0, 1.0)
+                    return float(np.sum(np.arccos(cos_a) ** 2))
+
+                inertia_cls  = _geodesic_inertia(cls_spectra_unit,  frechet_mean_cls)
+                inertia_null = _geodesic_inertia(null_spectra_unit, frechet_mean_cls)
+                ang_ratio = (inertia_cls / inertia_null
+                             if inertia_null > 0 else np.nan)
+
+                # -- per-pixel geodesic angles (full arrays for MW and HL)
+                angles_cls_geo  = np.arccos(
+                    np.clip(cls_spectra_unit  @ frechet_mean_cls, -1.0, 1.0))
+                _angles_null_ai = np.arccos(
+                    np.clip(null_spectra_unit @ frechet_mean_cls, -1.0, 1.0))
+
+                # -- Mann-Whitney U (one-sided, H1: classified angles < null)
+                _U, mwu_p = mannwhitneyu(angles_cls_geo, _angles_null_ai,
+                                         alternative='less')
+                n1, n2   = len(angles_cls_geo), len(_angles_null_ai)
+                # Rank-biserial r: +1 = all classified < all null (perfect)
+                effect_r = 1.0 - (2.0 * _U) / (n1 * n2)
+
+                # -- Hodges–Lehmann estimator (subsampled for memory)
+                _rng      = np.random.default_rng(42)
+                cls_idx   = _rng.choice(n1,
+                                        size=min(HL_SUBSAMPLE, n1),
+                                        replace=False)
+                null_idx  = _rng.choice(n2,
+                                        size=min(HL_SUBSAMPLE, n2),
+                                        replace=False)
+                _all_diffs = ((_angles_null_ai[null_idx][:, None]
+                               - angles_cls_geo[cls_idx][None, :]).ravel())
+                hl_shift_deg = float(np.median(_all_diffs) * 180.0 / np.pi)
+
+                _coherence = "< null (good)" if ang_ratio < 1.0 else ">= null (poor)"
+                print(f"     [3] Geodesic angular inertia:")
+                print(f"         inertia(cls) = {inertia_cls:.3f},  "
+                      f"inertia(null) = {inertia_null:.3f},  "
+                      f"ratio = {ang_ratio:.4f}  ({_coherence})")
+                print(f"         Mann-Whitney p = {mwu_p:.3e},  "
+                      f"HL shift = {hl_shift_deg:.2f}\u00b0,  "
+                      f"effect size r = {effect_r:.4f}")
         elif _ai_bg_spectra is not None:
-            print("     [3] Angular inertia: < 2 classified pixels — skipped.")
+            print("     [3] Geodesic angular inertia: "
+                  "< 2 classified pixels — skipped.")
         else:
-            print("     [3] Angular inertia: skipped "
+            print("     [3] Geodesic angular inertia: skipped "
                   "(mineral_spectra not provided or no background pixels).")
 
         row.update({
-            "Mean_angle_cls_deg":    (round(mean_cls_deg,  3)
-                                      if not np.isnan(mean_cls_deg)  else np.nan),
-            "Mean_angle_null_deg":   (round(mean_null_deg, 3)
-                                      if not np.isnan(mean_null_deg) else np.nan),
-            "Angular_inertia_ratio": (round(ang_ratio,     4)
-                                      if not np.isnan(ang_ratio)     else np.nan),
-            "MannWhitney_p":         (round(mwu_p,         6)
-                                      if not np.isnan(mwu_p)         else np.nan),
-            "Effect_size":           (round(effect_r,      4)
-                                      if not np.isnan(effect_r)      else np.nan),
+            "Angular_inertia_ratio": (round(ang_ratio,    4)
+                                      if not np.isnan(ang_ratio)    else np.nan),
+            "HL_shift_deg":          (round(hl_shift_deg, 3)
+                                      if not np.isnan(hl_shift_deg) else np.nan),
+            "MannWhitney_p":         (round(mwu_p,        6)
+                                      if not np.isnan(mwu_p)        else np.nan),
+            "Effect_size":           (round(effect_r,     4)
+                                      if not np.isnan(effect_r)     else np.nan),
         })
 
         # ── 4. Moran's I spatial autocorrelation ─────────────────────────
@@ -1998,8 +2036,8 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
             "Mineral", "Pixels", "Null_thr_deg", "Null_pixels",
             "Components", "Noise_px_frac",
             "Mean_angle_deg", "Std_angle_deg", "Skewness",
-            "Mean_angle_cls_deg", "Mean_angle_null_deg",
-            "Angular_inertia_ratio", "MannWhitney_p", "Effect_size",
+            "Angular_inertia_ratio", "HL_shift_deg",
+            "MannWhitney_p", "Effect_size",
             "Morans_I", "Morans_p", "Morans_sig",
         ]
         display_cols = [c for c in display_cols if c in df.columns]
