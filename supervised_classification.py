@@ -1165,14 +1165,17 @@ def _save_sam_cross_method_figure(sup_amd, lib_any, per_mineral,
         Patch(fc=[0.88, 0.88, 0.88], ec="0.4", lw=0.5,
               label="Neither / non-soil"),
     ]
-    ax_map.legend(
-        handles=legend_elements,
-        loc="lower right",
-        fontsize=8.5, ncol=2,
-        frameon=True, fancybox=False, edgecolor="0.4",
-    )
+    _add_scale_north_arrow(ax_map, cols, sb_y=0.06)
 
-    _add_scale_north_arrow(ax_map, cols, sb_y=0.15)
+    fig.legend(
+        handles=legend_elements,
+        fontsize=8.5, ncol=1,
+        frameon=True, fancybox=False, edgecolor="0.4",
+        loc="lower center",
+        bbox_to_anchor=(0.325, 0.01),
+        bbox_transform=fig.transFigure,
+    )
+    fig.subplots_adjust(bottom=0.18, wspace=0.45)
 
     # ── Right: per-mineral containment bar chart ──────────────────────────
     ax_bar = axes[1]
