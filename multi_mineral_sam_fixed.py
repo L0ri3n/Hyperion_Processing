@@ -622,8 +622,13 @@ def main():
         create_composite_map(sam_angles_dict, match_scores_dict,
                            mineral_names, operative_thresholds, soil_mask, OUTPUT_FOLDER)
 
+    # Hematite vs Schwertmannite overlap analysis and comparison figure
+    print("\n9b. Hematite / Schwertmannite overlap analysis...")
+    save_hematite_schwertmannite_comparison(
+        sam_angles_dict, operative_thresholds, soil_mask, OUTPUT_FOLDER)
+
     # Compare adaptive vs null-model thresholds
-    print("\n9b. Comparing adaptive vs null-model thresholds...")
+    print("\n9c. Comparing adaptive vs null-model thresholds...")
     compare_thresholds(
         sam_angles_dict, soil_mask, thresholds,
         null_thresholds, mineral_names, cube,
@@ -707,7 +712,7 @@ def create_diagnostic_plots(cube, wavelengths, mineral_names, output_folder):
 
     ax.imshow(rgb)
     ax.set_title('Hyperion RGB Composite (Approximate True Color)', fontsize=13, fontweight='bold')
-    ax.axis('off')
+    _add_coordinate_ticks(ax, rgb.shape[0], cols)
     _add_scale_north_arrow(ax, cols, sb_y=0.04)
     plt.tight_layout()
     plt.savefig(diag_dir / "hyperion_rgb.png", dpi=150, bbox_inches='tight')
@@ -863,6 +868,165 @@ def _add_scale_north_arrow(ax, img_cols, pixel_m=30.0, scale_km=5.0, sb_y=0.04,
             fontsize=6.5, color='black', zorder=5)
 
 
+def _parse_envi_map_info(metadata):
+    """Return a dict with UTM georef parameters from an ENVI map_info field."""
+    raw = metadata.get('map info', metadata.get('map_info', None))
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        parts = [str(p).strip().strip('{}') for p in raw]
+    else:
+        parts = [p.strip().strip('{}') for p in str(raw).split(',')]
+    if len(parts) < 9:
+        return None
+    try:
+        return {
+            'projection':   parts[0].strip(),
+            'x_pixel':      float(parts[1]),
+            'y_pixel':      float(parts[2]),
+            'easting':      float(parts[3]),
+            'northing':     float(parts[4]),
+            'pixel_size_x': float(parts[5]),
+            'pixel_size_y': float(parts[6]),
+            'zone':         int(float(parts[7])),
+            'hemisphere':   parts[8].strip().lower(),
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def _add_coordinate_ticks(ax, rows, cols, metadata=None, n_lon=5, n_lat=6):
+    """Decorate *ax* borders with lat/lon ticks — no interior grid lines.
+
+    Uses a pure-math UTM→WGS-84 inverse Transverse Mercator projection.
+    Falls back to ax.axis('off') if georef data is unavailable.
+    """
+    import math
+
+    if metadata is None:
+        metadata = sp.open_image(HDR_FILE).metadata
+
+    mi = _parse_envi_map_info(metadata)
+    if mi is None:
+        ax.axis('off')
+        return
+
+    def _utm_to_latlon(easting, northing, zone, northern=True):
+        a   = 6378137.0
+        f   = 1 / 298.257223563
+        e2  = 2*f - f**2
+        ep2 = e2 / (1 - e2)
+        k0  = 0.9996
+        E0  = 500000.0
+        N0  = 0.0 if northern else 10_000_000.0
+        lon0 = math.radians((zone - 1) * 6 - 180 + 3)
+        x = easting  - E0
+        y = northing - N0
+        M   = y / k0
+        mu  = M / (a * (1 - e2/4 - 3*e2**2/64 - 5*e2**3/256))
+        e1  = (1 - math.sqrt(1 - e2)) / (1 + math.sqrt(1 - e2))
+        ph1 = (mu
+               + (3*e1/2 - 27*e1**3/32) * math.sin(2*mu)
+               + (21*e1**2/16 - 55*e1**4/32) * math.sin(4*mu)
+               + (151*e1**3/96) * math.sin(6*mu)
+               + (1097*e1**4/512) * math.sin(8*mu))
+        N1  = a / math.sqrt(1 - e2 * math.sin(ph1)**2)
+        T1  = math.tan(ph1)**2
+        C1  = ep2 * math.cos(ph1)**2
+        R1  = a * (1 - e2) / (1 - e2 * math.sin(ph1)**2)**1.5
+        D   = x / (N1 * k0)
+        lat = ph1 - (N1 * math.tan(ph1) / R1) * (
+            D**2/2
+            - (5 + 3*T1 + 10*C1 - 4*C1**2 - 9*ep2) * D**4/24
+            + (61 + 90*T1 + 298*C1 + 45*T1**2 - 252*ep2 - 3*C1**2) * D**6/720)
+        lon = lon0 + (
+            D
+            - (1 + 2*T1 + C1) * D**3/6
+            + (5 - 2*C1 + 28*T1 - 3*C1**2 + 8*ep2 + 24*T1**2) * D**5/120
+        ) / math.cos(ph1)
+        return math.degrees(lat), math.degrees(lon)
+
+    northern = 'north' in mi['hemisphere']
+
+    def _px_to_latlon(col, row):
+        e = mi['easting']  + (col - (mi['x_pixel'] - 1)) * mi['pixel_size_x']
+        n = mi['northing'] - (row - (mi['y_pixel'] - 1)) * mi['pixel_size_y']
+        return _utm_to_latlon(e, n, mi['zone'], northern)
+
+    corners = [_px_to_latlon(c, r)
+               for c, r in [(0, 0), (cols-1, 0), (0, rows-1), (cols-1, rows-1)]]
+    lat_min = min(c[0] for c in corners)
+    lat_max = max(c[0] for c in corners)
+    lon_min = min(c[1] for c in corners)
+    lon_max = max(c[1] for c in corners)
+
+    def _nice_step(span, n):
+        raw = span / n
+        for step in [1/120, 1/60, 1/30, 1/12, 1/6, 0.5, 1.0, 2.0, 5.0, 10.0]:
+            if step >= raw * 0.8:
+                return step
+        return 1.0
+
+    lat_step = _nice_step(lat_max - lat_min, n_lat)
+    lon_step = _nice_step(lon_max - lon_min, n_lon)
+    lat_ticks = np.arange(math.ceil(lat_min / lat_step) * lat_step,
+                          lat_max + lat_step * 0.01, lat_step)
+    lon_ticks = np.arange(math.ceil(lon_min / lon_step) * lon_step,
+                          lon_max + lon_step * 0.01, lon_step)
+
+    mid_col = (cols - 1) / 2
+    mid_row = (rows - 1) / 2
+
+    def _lat_to_row(lat_val):
+        lat_top, _ = _px_to_latlon(mid_col, 0)
+        lat_bot, _ = _px_to_latlon(mid_col, rows - 1)
+        if lat_top == lat_bot:
+            return mid_row
+        return (lat_val - lat_top) / (lat_bot - lat_top) * (rows - 1)
+
+    def _lon_to_col(lon_val):
+        _, lon_left  = _px_to_latlon(0, mid_row)
+        _, lon_right = _px_to_latlon(cols - 1, mid_row)
+        if lon_left == lon_right:
+            return mid_col
+        return (lon_val - lon_left) / (lon_right - lon_left) * (cols - 1)
+
+    row_pos = [_lat_to_row(v) for v in lat_ticks]
+    col_pos = [_lon_to_col(v) for v in lon_ticks]
+
+    valid_lat = [(r, v) for r, v in zip(row_pos, lat_ticks) if -0.5 <= r <= rows - 0.5]
+    valid_lon = [(c, v) for c, v in zip(col_pos, lon_ticks) if -0.5 <= c <= cols - 0.5]
+
+    def _fmt(deg, is_lat):
+        hemi = ('N' if deg >= 0 else 'S') if is_lat else ('E' if deg >= 0 else 'W')
+        d = abs(deg)
+        deg_int = int(d)
+        minutes = (d - deg_int) * 60
+        if abs(minutes) < 0.05:
+            return f"{deg_int}°{hemi}"
+        return f"{deg_int}°{minutes:.0f}′{hemi}"
+
+    if valid_lat:
+        rp, lv = zip(*valid_lat)
+        ax.set_yticks(list(rp))
+        ax.set_yticklabels([_fmt(v, True) for v in lv], fontsize=7)
+
+    if valid_lon:
+        cp, lv = zip(*valid_lon)
+        ax.set_xticks(list(cp))
+        ax.set_xticklabels([_fmt(v, False) for v in lv], fontsize=7,
+                           rotation=45, ha='right')
+
+    ax.tick_params(axis='both', which='both', direction='out', length=3, width=0.6,
+                   top=True, bottom=True, left=True, right=True,
+                   labeltop=True, labelbottom=True, labelleft=True, labelright=True)
+    ax.minorticks_off()
+    ax.grid(False)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.6)
+
+
 def save_soil_mask_plot(soil_mask, ndvi, mndwi, output_folder):
     """Save publication-quality pre-classification soil mask figure."""
     from matplotlib.patches import Patch
@@ -989,6 +1153,7 @@ def save_individual_map(match_score, sam_angles, mineral_name, threshold, output
     # Mask nodata (sam_angles == pi means non-soil or nodata)
     is_nodata = sam_angles >= np.pi
     match_m = np.ma.masked_where(is_nodata, match_score)
+    rows, cols = sam_angles.shape
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.5, 5.0))
     for ax in (ax1, ax2):
@@ -1003,7 +1168,7 @@ def save_individual_map(match_score, sam_angles, mineral_name, threshold, output
     ax1.text(0.02, 0.97, '(a)', transform=ax1.transAxes,
              fontsize=10, fontweight='bold', va='top',
              bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
-    ax1.axis('off')
+    _add_coordinate_ticks(ax1, rows, cols)
     cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
     cbar1.set_label('Match score', fontsize=8)
     cbar1.ax.tick_params(labelsize=7)
@@ -1022,7 +1187,7 @@ def save_individual_map(match_score, sam_angles, mineral_name, threshold, output
     ax2.text(0.02, 0.97, '(b)', transform=ax2.transAxes,
              fontsize=10, fontweight='bold', va='top',
              bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
-    ax2.axis('off')
+    _add_coordinate_ticks(ax2, rows, cols)
 
     from matplotlib.patches import Patch
     ax2.legend(
@@ -1134,7 +1299,7 @@ def create_composite_map(sam_angles_dict, match_scores_dict, mineral_names, thre
     ax_class.text(0.02, 0.98, '(a)', transform=ax_class.transAxes,
                   fontsize=10, fontweight='bold', va='top',
                   bbox=dict(boxstyle='square,pad=0.15', fc='white', ec='none', alpha=0.8))
-    ax_class.axis('off')
+    _add_coordinate_ticks(ax_class, rows, cols)
 
     # Legend
     legend_elements = [
@@ -1326,8 +1491,9 @@ def _compute_morans_i(binary_mask, soil_r, soil_c,
     """Compute Moran's I for *binary_mask* restricted to the soil domain.
 
     Connectivity is Queen (8-neighbours) within the soil-pixel set; weights
-    are row-standardised.  Uses the normal-approximation z-score and p-value
-    (no permutations) for speed.
+    are row-standardised.  Uses a permutation test (999 permutations) to
+    obtain a pseudo p-value, which avoids the normality assumption that is
+    inappropriate for binary data.
 
     Parameters
     ----------
@@ -1338,7 +1504,7 @@ def _compute_morans_i(binary_mask, soil_r, soil_c,
 
     Returns
     -------
-    I, z, p : float
+    I, p : float
     sig_str : str  – human-readable significance description
     """
     import warnings
@@ -1370,10 +1536,10 @@ def _compute_morans_i(binary_mask, soil_r, soil_c,
 
     y = binary_mask[soil_r, soil_c].astype(np.float64)
     if y.std() < 1e-12:
-        return np.nan, np.nan, np.nan, "N/A (constant mask)"
+        return np.nan, np.nan, "N/A (constant mask)"
 
-    mi = Moran(y, w, permutations=0)
-    I, z, p = mi.I, mi.z_norm, mi.p_norm
+    mi = Moran(y, w, permutations=999)
+    I, p = mi.I, mi.p_sim
 
     if p < 0.05 and I > 0:
         sig = "clustered (p<0.05)"
@@ -1382,7 +1548,7 @@ def _compute_morans_i(binary_mask, soil_r, soil_c,
     else:
         sig = f"random (p={p:.3f})"
 
-    return I, z, p, sig
+    return I, p, sig
 
 
 def _save_angle_distribution_figure(name, short, angles_cls,
@@ -1794,7 +1960,7 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
                 "Angular_inertia_ratio": np.nan,
                 "HL_shift_deg": np.nan,
                 "MannWhitney_p": np.nan, "Effect_size": np.nan,
-                "Morans_I": np.nan, "Morans_z": np.nan,
+                "Morans_I": np.nan,
                 "Morans_p": np.nan, "Morans_sig": "N/A",
             })
             summary_rows.append(row)
@@ -1905,6 +2071,13 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
                 # Rank-biserial r: +1 = all classified < all null (perfect)
                 effect_r = 1.0 - (2.0 * _U) / (n1 * n2)
 
+                # scipy's normal approximation underflows to 0.0 for very
+                # large samples with strong separation; apply the conventional
+                # machine-epsilon floor (R's "<2.2e-16" convention).
+                _mwu_underflow = (mwu_p == 0.0)
+                if _mwu_underflow:
+                    mwu_p = np.finfo(np.float64).eps  # ≈ 2.2e-16
+
                 # -- Hodges–Lehmann estimator (subsampled for memory)
                 _rng      = np.random.default_rng(42)
                 cls_idx   = _rng.choice(n1,
@@ -1918,11 +2091,13 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
                 hl_shift_deg = float(np.median(_all_diffs) * 180.0 / np.pi)
 
                 _coherence = "< null (good)" if ang_ratio < 1.0 else ">= null (poor)"
+                _p_str = (f"< {mwu_p:.3e} (float64 underflow)"
+                          if _mwu_underflow else f"{mwu_p:.3e}")
                 print(f"     [3] Geodesic angular inertia:")
                 print(f"         inertia(cls) = {inertia_cls:.3f},  "
                       f"inertia(null) = {inertia_null:.3f},  "
                       f"ratio = {ang_ratio:.4f}  ({_coherence})")
-                print(f"         Mann-Whitney p = {mwu_p:.3e},  "
+                print(f"         Mann-Whitney p = {_p_str},  "
                       f"HL shift = {hl_shift_deg:.2f}\u00b0,  "
                       f"effect size r = {effect_r:.4f}")
         elif _ai_bg_spectra is not None:
@@ -1937,23 +2112,23 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
                                       if not np.isnan(ang_ratio)    else np.nan),
             "HL_shift_deg":          (round(hl_shift_deg, 3)
                                       if not np.isnan(hl_shift_deg) else np.nan),
-            "MannWhitney_p":         (round(mwu_p,        6)
+            "MannWhitney_p":         (float(mwu_p)
                                       if not np.isnan(mwu_p)        else np.nan),
             "Effect_size":           (round(effect_r,     4)
                                       if not np.isnan(effect_r)     else np.nan),
         })
 
         # ── 4. Moran's I spatial autocorrelation ─────────────────────────
-        moran_I = moran_z = moran_p = np.nan
+        moran_I = moran_p = np.nan
         moran_sig = "N/A"
 
         if HAS_ESDA and len(soil_r) >= 4:
             try:
-                moran_I, moran_z, moran_p, moran_sig = _compute_morans_i(
+                moran_I, moran_p, moran_sig = _compute_morans_i(
                     binary_mask, soil_r, soil_c,
                     lps_weights, Moran)
                 print(f"     [4] Moran's I = {moran_I:.4f},  "
-                      f"z = {moran_z:.2f},  p = {moran_p:.4f}"
+                      f"p (permutation) = {moran_p:.4f}"
                       f"  ({moran_sig})")
             except Exception as exc:
                 print(f"     [4] Moran's I: failed ({exc})")
@@ -1965,8 +2140,6 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
         row.update({
             "Morans_I":   (round(moran_I,   4)
                            if not np.isnan(moran_I)   else np.nan),
-            "Morans_z":   (round(moran_z,   4)
-                           if not np.isnan(moran_z)   else np.nan),
             "Morans_p":   (round(moran_p,   4)
                            if not np.isnan(moran_p)   else np.nan),
             "Morans_sig": moran_sig,
@@ -2048,6 +2221,244 @@ def validate_sam_results(sam_angles_dict, thresholds, soil_mask, cube,
         print(f"\n  Full table saved: {csv_path}")
 
     print("=" * 70)
+
+
+def save_hematite_schwertmannite_comparison(sam_angles_dict, thresholds,
+                                             soil_mask, output_folder):
+    """Publication-quality 3-panel comparison of Hematite vs Schwertmannite.
+
+    Panels
+    ------
+    (a) Hematite binary detection map
+    (b) Schwertmannite binary detection map
+    (c) Spatial overlap map (4 categories) + overlap statistics annotation
+
+    Overlap metrics reported (console + CSV):
+    - Overlap / Hematite (%)
+    - Overlap / Schwertmannite (%)
+    - Jaccard index  = |A∩B| / |A∪B|
+    - Dice coefficient = 2|A∩B| / (|A|+|B|)
+    - Overlap coefficient = |A∩B| / min(|A|, |B|)
+
+    Cartographic elements: coordinate ticks on all panels, north arrow and
+    5 km scale bar on panel (c).
+    """
+    from matplotlib.patches import Patch
+    import matplotlib.gridspec as gridspec
+
+    mineral_names_local = list(sam_angles_dict.keys())
+
+    # ── locate the two minerals ───────────────────────────────────────────
+    hem_name = next(
+        (n for n in mineral_names_local if 'hematite' in n.lower()), None)
+    sch_name = next(
+        (n for n in mineral_names_local
+         if 'schwert' in n.lower() or 'schwerman' in n.lower()), None)
+
+    if hem_name is None or sch_name is None:
+        print(f"  [overlap] Could not find Hematite or Schwertmannite in library. "
+              f"Skipping comparison figure.")
+        return
+
+    thr_hem  = thresholds[hem_name]
+    thr_sch  = thresholds[sch_name]
+
+    mask_hem = (sam_angles_dict[hem_name] < thr_hem) & soil_mask
+    mask_sch = (sam_angles_dict[sch_name] < thr_sch) & soil_mask
+
+    # ── overlap statistics ────────────────────────────────────────────────
+    n_hem    = int(mask_hem.sum())
+    n_sch    = int(mask_sch.sum())
+    n_both   = int((mask_hem & mask_sch).sum())
+    n_either = int((mask_hem | mask_sch).sum())
+    n_soil   = int(soil_mask.sum())
+
+    pct_hem_soil = n_hem  / max(n_soil, 1) * 100
+    pct_sch_soil = n_sch  / max(n_soil, 1) * 100
+    pct_of_hem   = n_both / max(n_hem,  1) * 100
+    pct_of_sch   = n_both / max(n_sch,  1) * 100
+    jaccard      = n_both / max(n_either, 1) * 100
+    dice         = 2 * n_both / max(n_hem + n_sch, 1) * 100
+    ovl_coeff    = n_both / max(min(n_hem, n_sch), 1) * 100
+
+    print("\n" + "=" * 70)
+    print("HEMATITE / SCHWERTMANNITE OVERLAP ANALYSIS")
+    print("=" * 70)
+    print(f"  Hematite pixels           : {n_hem:>8,}  ({pct_hem_soil:.1f}% of soil)")
+    print(f"  Schwertmannite pixels     : {n_sch:>8,}  ({pct_sch_soil:.1f}% of soil)")
+    print(f"  Overlap (both)            : {n_both:>8,}")
+    print(f"  Union (either)            : {n_either:>8,}")
+    print(f"  Overlap / Hematite        : {pct_of_hem:.1f}%")
+    print(f"  Overlap / Schwertmannite  : {pct_of_sch:.1f}%")
+    print(f"  Jaccard index (IoU)       : {jaccard:.1f}%")
+    print(f"  Dice coefficient          : {dice:.1f}%")
+    print(f"  Overlap coefficient       : {ovl_coeff:.1f}%")
+    print("=" * 70)
+
+    # Save overlap stats CSV
+    stats_df = pd.DataFrame([{
+        'Metric': 'Hematite pixels',         'Value': n_hem,
+        'Unit': 'pixels'},
+        {'Metric': 'Schwertmannite pixels',  'Value': n_sch,
+        'Unit': 'pixels'},
+        {'Metric': 'Overlap pixels (both)',  'Value': n_both,
+        'Unit': 'pixels'},
+        {'Metric': 'Union pixels (either)',  'Value': n_either,
+        'Unit': 'pixels'},
+        {'Metric': 'Overlap / Hematite',     'Value': round(pct_of_hem, 2),
+        'Unit': '%'},
+        {'Metric': 'Overlap / Schwertmannite','Value': round(pct_of_sch, 2),
+        'Unit': '%'},
+        {'Metric': 'Jaccard index (IoU)',    'Value': round(jaccard, 2),
+        'Unit': '%'},
+        {'Metric': 'Dice coefficient',       'Value': round(dice, 2),
+        'Unit': '%'},
+        {'Metric': 'Overlap coefficient',    'Value': round(ovl_coeff, 2),
+        'Unit': '%'},
+    ])
+    csv_path = Path(output_folder) / "Hematite_Schwertmannite_Overlap_Stats.csv"
+    stats_df.to_csv(csv_path, index=False)
+    print(f"  Overlap stats saved: {csv_path.name}")
+
+    rows, cols = mask_hem.shape
+
+    # ── colour scheme ─────────────────────────────────────────────────────
+    HEM_COL  = np.array([0x5E/255, 0x3C/255, 0x99/255, 1.0])  # purple
+    SCH_COL  = np.array([0x17/255, 0xBE/255, 0xCF/255, 1.0])  # cyan
+    OVL_COL  = np.array([0xE6/255, 0x61/255, 0x01/255, 1.0])  # orange
+    SOIL_COL = np.array([0.80, 0.80, 0.80, 1.0])               # light grey
+    # white = non-soil / no-data
+
+    # ── build RGBA arrays ─────────────────────────────────────────────────
+    rgba_hem = np.ones((rows, cols, 4), dtype=np.float32)
+    rgba_hem[soil_mask] = SOIL_COL
+    rgba_hem[mask_hem]  = HEM_COL
+
+    rgba_sch = np.ones((rows, cols, 4), dtype=np.float32)
+    rgba_sch[soil_mask] = SOIL_COL
+    rgba_sch[mask_sch]  = SCH_COL
+
+    rgba_ovl = np.ones((rows, cols, 4), dtype=np.float32)
+    rgba_ovl[soil_mask]              = SOIL_COL
+    rgba_ovl[mask_hem & ~mask_sch]   = HEM_COL
+    rgba_ovl[mask_sch & ~mask_hem]   = SCH_COL
+    rgba_ovl[mask_hem &  mask_sch]   = OVL_COL
+
+    # ── figure layout ─────────────────────────────────────────────────────
+    short_hem = short_mineral_name(hem_name)
+    short_sch = short_mineral_name(sch_name)
+
+    _panel_h = 8.0
+    _panel_w = max(2.2, _panel_h * cols / rows)
+    _gap_in  = 0.40
+    _fig_w   = _panel_w * 3 + _gap_in * 2 + 0.30
+    # Extra height: 1.0 in for suptitle + 0.7 in for 2-line panel titles + 0.5 in bottom
+    _fig_h   = _panel_h + 2.2
+
+    fig = plt.figure(figsize=(_fig_w, _fig_h))
+    # top=0.84 leaves ~16% of figure height (≈1.5 in) above the axes for both
+    # the suptitle and the 2-line panel titles without overlap
+    gs  = gridspec.GridSpec(
+        1, 3, figure=fig,
+        left=0.03, right=0.97,
+        top=0.84,  bottom=0.05,
+        wspace=_gap_in / _panel_w,
+    )
+
+    # ── (a) Hematite ──────────────────────────────────────────────────────
+    ax_h = fig.add_subplot(gs[0, 0])
+    ax_h.set_facecolor('white')
+    ax_h.imshow(rgba_hem, interpolation='nearest')
+    ax_h.set_title(
+        f'(a) {short_hem}\n'
+        f'{n_hem:,} px  ({pct_hem_soil:.1f}% of soil)',
+        fontsize=9, fontweight='bold', pad=5)
+    _add_coordinate_ticks(ax_h, rows, cols)
+    ax_h.legend(
+        handles=[
+            Patch(fc=HEM_COL[:3],  ec='0.3', lw=0.4, label=short_hem),
+            Patch(fc=SOIL_COL[:3], ec='0.3', lw=0.4, label='Soil (unclassified)'),
+            Patch(fc='white',      ec='0.5', lw=0.4, label='Non-soil / no-data'),
+        ],
+        loc='lower right', fontsize=6.5, ncol=1,
+        frameon=True, fancybox=False, edgecolor='0.4',
+        handlelength=1.0, handleheight=0.8, borderpad=0.4, labelspacing=0.35)
+
+    # ── (b) Schwertmannite ────────────────────────────────────────────────
+    ax_s = fig.add_subplot(gs[0, 1])
+    ax_s.set_facecolor('white')
+    ax_s.imshow(rgba_sch, interpolation='nearest')
+    ax_s.set_title(
+        f'(b) {short_sch}\n'
+        f'{n_sch:,} px  ({pct_sch_soil:.1f}% of soil)',
+        fontsize=9, fontweight='bold', pad=5)
+    _add_coordinate_ticks(ax_s, rows, cols)
+    ax_s.legend(
+        handles=[
+            Patch(fc=SCH_COL[:3],  ec='0.3', lw=0.4, label=short_sch),
+            Patch(fc=SOIL_COL[:3], ec='0.3', lw=0.4, label='Soil (unclassified)'),
+            Patch(fc='white',      ec='0.5', lw=0.4, label='Non-soil / no-data'),
+        ],
+        loc='lower right', fontsize=6.5, ncol=1,
+        frameon=True, fancybox=False, edgecolor='0.4',
+        handlelength=1.0, handleheight=0.8, borderpad=0.4, labelspacing=0.35)
+
+    # ── (c) Overlap analysis ──────────────────────────────────────────────
+    ax_o = fig.add_subplot(gs[0, 2])
+    ax_o.set_facecolor('white')
+    ax_o.imshow(rgba_ovl, interpolation='nearest')
+    ax_o.set_title(
+        f'(c) Spatial overlap\n'
+        f'Jaccard = {jaccard:.1f}%  |  Dice = {dice:.1f}%',
+        fontsize=9, fontweight='bold', pad=5)
+    _add_coordinate_ticks(ax_o, rows, cols)
+
+    # North arrow + scale bar — lower-left corner to avoid legend clash
+    _add_scale_north_arrow(ax_o, cols, sb_y=0.04, sb_x0=0.03)
+
+    ax_o.legend(
+        handles=[
+            Patch(fc=HEM_COL[:3],  ec='0.3', lw=0.4,
+                  label=f'{short_hem} only  ({n_hem - n_both:,} px)'),
+            Patch(fc=SCH_COL[:3],  ec='0.3', lw=0.4,
+                  label=f'{short_sch} only  ({n_sch - n_both:,} px)'),
+            Patch(fc=OVL_COL[:3],  ec='0.3', lw=0.4,
+                  label=f'Both  ({n_both:,} px)'),
+            Patch(fc=SOIL_COL[:3], ec='0.3', lw=0.4,
+                  label='Soil (unclassified)'),
+            Patch(fc='white',      ec='0.5', lw=0.4,
+                  label='Non-soil / no-data'),
+        ],
+        loc='lower right', fontsize=6.5, ncol=1,
+        frameon=True, fancybox=False, edgecolor='0.4',
+        handlelength=1.0, handleheight=0.8, borderpad=0.4, labelspacing=0.30)
+
+    # Overlap statistics text box — upper left
+    stats_txt = (
+        f"Overlap / {short_hem:<15s}: {pct_of_hem:.1f}%\n"
+        f"Overlap / {short_sch:<15s}: {pct_of_sch:.1f}%\n"
+        f"Jaccard index (IoU)       : {jaccard:.1f}%\n"
+        f"Dice coefficient          : {dice:.1f}%\n"
+        f"Overlap coefficient       : {ovl_coeff:.1f}%"
+    )
+    ax_o.text(
+        0.03, 0.97, stats_txt,
+        transform=ax_o.transAxes,
+        fontsize=6.2, va='top', ha='left',
+        fontfamily='monospace',
+        bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='0.45',
+                  alpha=0.90, lw=0.7))
+
+    # Figure title — sits in the space above top=0.84
+    fig.suptitle(
+        'Hematite vs. Schwertmannite — SAM Classification Comparison',
+        fontsize=11, fontweight='bold', y=0.96)
+
+    out_path = Path(output_folder) / "Hematite_Schwertmannite_Comparison.png"
+    plt.savefig(out_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"  Saved: {out_path.name}")
+    if not SHOW_PLOTS:
+        plt.close()
 
 
 if __name__ == "__main__":

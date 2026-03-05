@@ -149,8 +149,9 @@ def _compute_morans_i(binary_mask, soil_r, soil_c, lps_weights, Moran):
     """Compute Moran's I for *binary_mask* restricted to the soil domain.
 
     Uses Queen (8-neighbour) contiguity weights within the soil-pixel set
-    with row-standardisation.  The normal-approximation z-score and p-value
-    are used (no permutations) for computational speed.
+    with row-standardisation.  Uses a permutation test (999 permutations) to
+    obtain a pseudo p-value, which avoids the normality assumption that is
+    inappropriate for binary data.
 
     This is a direct copy of the helper from multi_mineral_sam_fixed.py to
     maintain methodological consistency across SAM and RF validations.
@@ -165,8 +166,7 @@ def _compute_morans_i(binary_mask, soil_r, soil_c, lps_weights, Moran):
     Returns
     -------
     I : float        — Moran's I statistic
-    z : float        — normal-approximation z-score
-    p : float        — two-tailed p-value
+    p : float        — permutation-based pseudo p-value
     sig_str : str    — human-readable significance description
     """
     # Build a fast (row, col) → soil-array index lookup
@@ -202,10 +202,10 @@ def _compute_morans_i(binary_mask, soil_r, soil_c, lps_weights, Moran):
 
     y = binary_mask[soil_r, soil_c].astype(np.float64)
     if y.std() < 1e-12:
-        return np.nan, np.nan, np.nan, "N/A (constant mask)"
+        return np.nan, np.nan, "N/A (constant mask)"
 
-    mi  = Moran(y, w, permutations=0)
-    I, z, p = float(mi.I), float(mi.z_norm), float(mi.p_norm)
+    mi  = Moran(y, w, permutations=999)
+    I, p = float(mi.I), float(mi.p_sim)
 
     if   p < 0.05 and I > 0:
         sig = "clustered (p<0.05)"
@@ -214,7 +214,7 @@ def _compute_morans_i(binary_mask, soil_r, soil_c, lps_weights, Moran):
     else:
         sig = f"random (p={p:.3f})"
 
-    return I, z, p, sig
+    return I, p, sig
 
 
 def _hex_to_rgba(hex_color, alpha=1.0):
@@ -656,11 +656,11 @@ def validate_sam_supervised_results(class_map, angle_maps, min_angle_map,
 
         # (b) Moran's I
         if HAS_ESDA and n_px >= 2:
-            mi_I, mi_z, mi_p, mi_sig = _compute_morans_i(
+            mi_I, mi_p, mi_sig = _compute_morans_i(
                 binary, soil_r, soil_c, lps_weights, Moran
             )
         else:
-            mi_I, mi_z, mi_p = np.nan, np.nan, np.nan
+            mi_I, mi_p = np.nan, np.nan
             mi_sig = "skipped (esda missing or n=0)"
 
         nf_str = f"{noise_frac:.3f}" if not np.isnan(noise_frac) else "N/A"
@@ -685,7 +685,6 @@ def validate_sam_supervised_results(class_map, angle_maps, min_angle_map,
             "mean_min_angle_deg": mean_ang,
             "std_min_angle_deg":  std_ang,
             "moran_I":            mi_I,
-            "moran_z":            mi_z,
             "moran_p":            mi_p,
             "moran_sig":          mi_sig,
         })
@@ -754,6 +753,187 @@ def save_sam_supervised_outputs(class_map, angle_maps, class_names, output_dir):
     _save_sam_supervised_figure(class_map, class_names, output_dir)
 
 
+def _parse_envi_map_info(metadata):
+    """Return a dict with UTM georef parameters from an ENVI map_info field.
+
+    Returns None if the field is absent or cannot be parsed.
+    """
+    raw = metadata.get('map info', metadata.get('map_info', None))
+    if raw is None:
+        return None
+    # spectral may return it as a list of stripped tokens or a single string
+    if isinstance(raw, (list, tuple)):
+        parts = [str(p).strip().strip('{}') for p in raw]
+    else:
+        parts = [p.strip().strip('{}') for p in str(raw).split(',')]
+    if len(parts) < 9:
+        return None
+    try:
+        return {
+            'projection':  parts[0].strip(),
+            'x_pixel':     float(parts[1]),   # reference pixel (1-based)
+            'y_pixel':     float(parts[2]),
+            'easting':     float(parts[3]),   # UTM easting of reference pixel centre
+            'northing':    float(parts[4]),   # UTM northing of reference pixel centre
+            'pixel_size_x': float(parts[5]),
+            'pixel_size_y': float(parts[6]),
+            'zone':        int(float(parts[7])),
+            'hemisphere':  parts[8].strip().lower(),
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def _add_coordinate_ticks(ax, rows, cols, metadata=None, n_lon=5, n_lat=6):
+    """Decorate *ax* borders with lat/lon ticks — no interior grid lines.
+
+    Parses UTM georeferencing from the ENVI header (uses the module-level
+    HDR_FILE if *metadata* is not supplied) and places formatted degree-minute
+    labels on all four sides of the axes frame.
+
+    Parameters
+    ----------
+    ax       : matplotlib Axes  (imshow already called; y-axis inverted)
+    rows, cols : image dimensions in pixels
+    metadata : ENVI header dict (spectral img.metadata).  If None the global
+               HDR_FILE is opened automatically.
+    n_lon, n_lat : approximate number of ticks for the lon / lat axes.
+    """
+    import math
+
+    if metadata is None:
+        metadata = sp.open_image(HDR_FILE).metadata
+
+    mi = _parse_envi_map_info(metadata)
+    if mi is None:
+        ax.axis('off')
+        return
+
+    def _utm_to_latlon(easting, northing, zone, northern=True):
+        """Pure-math UTM → WGS-84 lat/lon (degrees); no external library needed."""
+        a   = 6378137.0
+        f   = 1 / 298.257223563
+        e2  = 2*f - f**2
+        ep2 = e2 / (1 - e2)
+        k0  = 0.9996
+        E0  = 500000.0
+        N0  = 0.0 if northern else 10_000_000.0
+        lon0 = math.radians((zone - 1) * 6 - 180 + 3)
+
+        x = easting  - E0
+        y = northing - N0
+
+        M   = y / k0
+        mu  = M / (a * (1 - e2/4 - 3*e2**2/64 - 5*e2**3/256))
+        e1  = (1 - math.sqrt(1 - e2)) / (1 + math.sqrt(1 - e2))
+        ph1 = (mu
+               + (3*e1/2 - 27*e1**3/32) * math.sin(2*mu)
+               + (21*e1**2/16 - 55*e1**4/32) * math.sin(4*mu)
+               + (151*e1**3/96) * math.sin(6*mu)
+               + (1097*e1**4/512) * math.sin(8*mu))
+
+        N1  = a / math.sqrt(1 - e2 * math.sin(ph1)**2)
+        T1  = math.tan(ph1)**2
+        C1  = ep2 * math.cos(ph1)**2
+        R1  = a * (1 - e2) / (1 - e2 * math.sin(ph1)**2)**1.5
+        D   = x / (N1 * k0)
+
+        lat = ph1 - (N1 * math.tan(ph1) / R1) * (
+            D**2/2
+            - (5 + 3*T1 + 10*C1 - 4*C1**2 - 9*ep2) * D**4/24
+            + (61 + 90*T1 + 298*C1 + 45*T1**2 - 252*ep2 - 3*C1**2) * D**6/720)
+        lon = lon0 + (
+            D
+            - (1 + 2*T1 + C1) * D**3/6
+            + (5 - 2*C1 + 28*T1 - 3*C1**2 + 8*ep2 + 24*T1**2) * D**5/120
+        ) / math.cos(ph1)
+
+        return math.degrees(lat), math.degrees(lon)
+
+    northern = 'north' in mi['hemisphere']
+
+    def _px_to_latlon(col, row):
+        e = mi['easting']  + (col - (mi['x_pixel'] - 1)) * mi['pixel_size_x']
+        n = mi['northing'] - (row - (mi['y_pixel'] - 1)) * mi['pixel_size_y']
+        return _utm_to_latlon(e, n, mi['zone'], northern)
+
+    # Lat/lon at image corners to determine tick range
+    corners = [_px_to_latlon(c, r)
+               for c, r in [(0, 0), (cols - 1, 0), (0, rows - 1), (cols - 1, rows - 1)]]
+    lat_min = min(c[0] for c in corners)
+    lat_max = max(c[0] for c in corners)
+    lon_min = min(c[1] for c in corners)
+    lon_max = max(c[1] for c in corners)
+
+    def _nice_step(span, n):
+        raw = span / n
+        for step in [1/120, 1/60, 1/30, 1/12, 1/6, 0.5, 1.0, 2.0, 5.0, 10.0]:
+            if step >= raw * 0.8:
+                return step
+        return 1.0
+
+    lat_step = _nice_step(lat_max - lat_min, n_lat)
+    lon_step = _nice_step(lon_max - lon_min, n_lon)
+    lat_ticks = np.arange(math.ceil(lat_min / lat_step) * lat_step,
+                          lat_max + lat_step * 0.01, lat_step)
+    lon_ticks = np.arange(math.ceil(lon_min / lon_step) * lon_step,
+                          lon_max + lon_step * 0.01, lon_step)
+
+    # Convert lat/lon tick values → pixel positions using the mid-edge scan
+    mid_col = (cols - 1) / 2
+    mid_row = (rows - 1) / 2
+
+    def _lat_to_row(lat_val):
+        lat_top, _ = _px_to_latlon(mid_col, 0)
+        lat_bot, _ = _px_to_latlon(mid_col, rows - 1)
+        if lat_top == lat_bot:
+            return mid_row
+        return (lat_val - lat_top) / (lat_bot - lat_top) * (rows - 1)
+
+    def _lon_to_col(lon_val):
+        _, lon_left  = _px_to_latlon(0, mid_row)
+        _, lon_right = _px_to_latlon(cols - 1, mid_row)
+        if lon_left == lon_right:
+            return mid_col
+        return (lon_val - lon_left) / (lon_right - lon_left) * (cols - 1)
+
+    row_pos = [_lat_to_row(v) for v in lat_ticks]
+    col_pos = [_lon_to_col(v) for v in lon_ticks]
+
+    valid_lat = [(r, v) for r, v in zip(row_pos, lat_ticks) if -0.5 <= r <= rows - 0.5]
+    valid_lon = [(c, v) for c, v in zip(col_pos, lon_ticks) if -0.5 <= c <= cols - 0.5]
+
+    def _fmt(deg, is_lat):
+        hemi = ('N' if deg >= 0 else 'S') if is_lat else ('E' if deg >= 0 else 'W')
+        d = abs(deg)
+        deg_int = int(d)
+        minutes = (d - deg_int) * 60
+        if abs(minutes) < 0.05:
+            return f"{deg_int}°{hemi}"
+        return f"{deg_int}°{minutes:.0f}′{hemi}"
+
+    if valid_lat:
+        rp, lv = zip(*valid_lat)
+        ax.set_yticks(list(rp))
+        ax.set_yticklabels([_fmt(v, True) for v in lv], fontsize=7)
+
+    if valid_lon:
+        cp, lv = zip(*valid_lon)
+        ax.set_xticks(list(cp))
+        ax.set_xticklabels([_fmt(v, False) for v in lv], fontsize=7,
+                           rotation=45, ha='right')
+
+    # Ticks on all four sides, no grid
+    ax.tick_params(axis='both', which='both', direction='out', length=3, width=0.6,
+                   top=True, bottom=True, left=True, right=True,
+                   labeltop=True, labelbottom=True, labelleft=True, labelright=True)
+    ax.minorticks_off()
+    ax.grid(False)
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.6)
+
+
 def _add_scale_north_arrow(ax, img_cols, pixel_m=30.0, scale_km=5.0, sb_y=0.04):
     """Overlay a north arrow and a scale bar onto *ax*, both INSIDE the axes.
 
@@ -814,7 +994,7 @@ def _save_sam_supervised_figure(class_map, class_names, output_dir):
         f"min component = {MIN_COMPONENT_SIZE} px)",
         fontsize=11, fontweight="bold",
     )
-    ax.axis("off")
+    _add_coordinate_ticks(ax, rows, cols)
 
     legend_elements = [
         Patch(fc=(0.78, 0.78, 0.78), ec="0.5", lw=0.4,
